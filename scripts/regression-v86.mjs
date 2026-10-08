@@ -1,0 +1,14 @@
+import fs from 'node:fs';
+import path from 'node:path';
+const root=process.cwd();
+const pkg=JSON.parse(fs.readFileSync(path.join(root,'package.json'),'utf8'));
+if(pkg.version!=='86.0.0') throw new Error('package version mismatch');
+const worker=fs.readFileSync(path.join(root,'worker/index.ts'),'utf8');
+if(worker.includes('}}\\n    const tournamentShareV84')) throw new Error('escaped route newline remains');
+if(!worker.includes('async function runShareMaintenance')) throw new Error('maintenance function missing');
+if(!worker.includes("production-readiness-v85")) throw new Error('v85 readiness route missing');
+if(worker.includes(".run())); for(const e of errors)")) throw new Error('maintenance persistence syntax regression');
+if(!worker.includes("first<any>()); history.push")) throw new Error('tournament history closure regression');
+const context=fs.readFileSync(path.join(root,'docs/continuation/ZATO_PROJECT_CONTEXT.md'),'utf8');
+if(!context.includes('V86')) throw new Error('continuation not updated');
+console.log('V86 regression OK');

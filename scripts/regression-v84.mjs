@@ -1,0 +1,13 @@
+import fs from 'node:fs';
+import path from 'node:path';
+const root=process.cwd(); const read=p=>fs.readFileSync(path.join(root,p),'utf8');
+const pkg=JSON.parse(read('package.json')); if(pkg.version!=='84.0.0') throw new Error('version 84 bekleniyor');
+const mig=read('db/migrations/V84.sql');
+for(const t of ['tournament_share_v84_verification_replay_comparisons','tournament_share_v84_policy_incident_evidence','tournament_share_v84_replay_health']) if(!mig.includes(`CREATE TABLE IF NOT EXISTS ${t}`)) throw new Error(`V84 tablo eksik: ${t}`);
+const worker=read('worker/index.ts');
+for(const x of ['createV84ReplayHealth','runV84ReplayComparison','appendV84IncidentEvidence','verification-replay-comparison-v84','policy-incidents-v84','scheduled-replay-v84']) if(!worker.includes(x)) throw new Error(`V84 worker eksik: ${x}`);
+if(!worker.includes("version:'84.0.0'")) throw new Error('V84 readiness version eksik');
+if(!worker.includes("v84:'verification-replay-comparison-policy-incident-evidence-scheduled-replay-health-1.0-hardening'")) throw new Error('V84 readiness marker eksik');
+const app=read('src/App.tsx'); for(const x of ['loadTournamentShareV84','compareTournamentShareV84','recordTournamentShareV84Evidence','share-v84-ops']) if(!app.includes(x)) throw new Error(`V84 UI eksik: ${x}`);
+for(const f of ['docs/releases/V84_RELEASE_NOTES.md','docs/releases/V84_PRODUCTION_CHECKLIST.md','docs/continuation/ZATO_PROJECT_CONTEXT.md','docs/continuation/ARCHITECTURE.md','docs/continuation/CURRENT_STATE.md','docs/continuation/NEXT_STEPS.md']) if(!fs.existsSync(path.join(root,f))) throw new Error(`devir dokümanı eksik: ${f}`);
+console.log('V84 regression OK');

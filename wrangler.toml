@@ -8,7 +8,7 @@ directory = "./dist"
 [[d1_databases]]
 binding = "DB"
 database_name = "zato-chess"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "3bc201ad-5257-4c1d-9454-17431f48dcc2"
 
 [[durable_objects.bindings]]
 name = "ROOMS"

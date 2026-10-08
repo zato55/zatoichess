@@ -1,0 +1,14 @@
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const root=new URL('..',import.meta.url).pathname;
+const pkg=JSON.parse(fs.readFileSync(root+'package.json','utf8'));
+const worker=fs.readFileSync(root+'worker/index.ts','utf8');
+const mig=fs.readFileSync(root+'db/migrations/V74.sql','utf8');
+assert.equal(pkg.version,'74.0.0');
+for(const x of ['regression:v74']) assert.ok(pkg.scripts[x]);
+for(const x of ['tournament_share_replay_bundle_signatures','tournament_share_matrix_diffs','tournament_share_retention_action_audit','tournament_share_contract_cleanup_replays']) assert.ok(mig.includes(x));
+for(const x of ['replay-bundle','contract-evidence','retention-error-persist','cleanup-replay']) assert.ok(worker.includes(x));
+assert.ok(worker.includes('appendRetentionActionAudit'));
+assert.ok(worker.includes("v74:'signed-replay-bundle-verification-snapshot-diffs-retention-action-audit-contract-cleanup-replay'"));
+assert.ok(worker.includes("version:'74.0.0'"));
+console.log('V74 regression OK');

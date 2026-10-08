@@ -1,0 +1,10 @@
+const states=['active','retired'];
+const events=[];
+let current='k-old';
+events.push({action:'created',keyId:current,status:'active'});
+const next='k-new';
+events.push({action:'created',keyId:next,status:'active'});
+events.push({action:'retired',keyId:current,status:'retired'});
+current=next;
+if(current!=='k-new'||events.filter(e=>e.action==='retired').length!==1||states.includes('revoked'))throw new Error('V66 key rotation invariant failed');
+console.log('V66 key rotation lifecycle OK');

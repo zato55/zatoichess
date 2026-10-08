@@ -1,0 +1,10 @@
+import fs from 'node:fs';
+const pkg=JSON.parse(fs.readFileSync(new URL('../package.json',import.meta.url),'utf8'));
+const worker=fs.readFileSync(new URL('../worker/index.ts',import.meta.url),'utf8');
+const migration=fs.readFileSync(new URL('../db/migrations/V71.sql',import.meta.url),'utf8');
+const app=fs.readFileSync(new URL('../src/App.tsx',import.meta.url),'utf8');
+for(const x of ['tournamentShareRetentionRuns','tournamentShareVerificationIncidents','tournamentShareReplayCompare','tournament_share_verification_incidents']) if(!worker.includes(x)) throw new Error(`missing worker contract ${x}`);
+for(const x of ['tournament_share_verification_incidents','idx_tournament_share_verification_incidents_fingerprint']) if(!migration.includes(x)) throw new Error(`missing migration ${x}`);
+for(const x of ['71.0.0','regression:v71']) if(!JSON.stringify(pkg).includes(x)) throw new Error(`missing package ${x}`);
+for(const x of ['loadTournamentShareRetentionRuns','actionTournamentShareIncident','compareTournamentShareReplays','Replay karşılaştırması']) if(!app.includes(x)) throw new Error(`missing UI ${x}`);
+console.log('V71 regression OK');

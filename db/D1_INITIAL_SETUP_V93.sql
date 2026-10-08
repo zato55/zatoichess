@@ -292,6 +292,7 @@ CREATE TABLE IF NOT EXISTS matchmaking_queue (
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
   CHECK (status IN ('waiting','matched','cancelled','expired'))
 );
+ALTER TABLE matchmaking_queue ADD COLUMN arena_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_matchmaking_waiting ON matchmaking_queue(status,time_control,created_at);
 CREATE INDEX IF NOT EXISTS idx_matchmaking_user_status ON matchmaking_queue(user_id,status,created_at DESC);
 
@@ -486,6 +487,10 @@ CREATE TABLE IF NOT EXISTS tournament_shares (
   FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tournament_shares_active ON tournament_shares(tournament_id) WHERE revoked_at IS NULL;
+ALTER TABLE tournament_shares ADD COLUMN views_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tournament_shares ADD COLUMN last_viewed_at TEXT;
+ALTER TABLE tournament_shares ADD COLUMN expires_at TEXT;
+ALTER TABLE tournament_shares ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public';
 CREATE INDEX IF NOT EXISTS idx_tournament_shares_token ON tournament_shares(token_hash);
 
 

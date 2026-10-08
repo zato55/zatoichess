@@ -1,26 +1,206 @@
 import { Chess } from 'chess.js';
 
-export interface Env { ROOMS: DurableObjectNamespace; DB?: D1Database; AUTH_SECRET?: string }
+export interface Env { ROOMS: DurableObjectNamespace; SOCIAL: DurableObjectNamespace; MATCHMAKING: DurableObjectNamespace; DB?: D1Database; AUTH_SECRET?: string; VAPID_PUBLIC_KEY?: string; VAPID_PRIVATE_JWK?: string; VAPID_SUBJECT?: string; SHARE_EXPORT_SIGNING_SECRET?: string; SHARE_EXPORT_SIGNING_KEY_ID?: string }
 type Color = 'w'|'b';
 type Player = { id:string; socket:WebSocket; color:Color; userId:string; username:string; displayName:string; rating:number };
 type MoveItem = { from:string; to:string; promotion?:string; color:Color; san:string; ply:number; fen:string; whiteMs:number; blackMs:number };
 type RoomPersisted = {
   roomCode:string; gameId:string; fen:string; started:boolean; players:Record<string,Color>; assignments:Record<string,Color>; playerUsers:Record<string,{userId:string;username:string;displayName:string;rating:number}>;
   history:MoveItem[]; whiteMs:number; blackMs:number; turnStartedAt:number|null;
-  result:string; startedAt:string; endedAt:string|null;
+  result:string; startedAt:string; endedAt:string|null; timeControl:string; incrementMs:number;
 };
 
 const INITIAL_MS = 10 * 60 * 1000;
+const TIME_CONTROLS:Record<string,{baseMs:number;incrementMs:number}>={'10+0':{baseMs:600000,incrementMs:0},'5+0':{baseMs:300000,incrementMs:0},'3+2':{baseMs:180000,incrementMs:2000}};
 const ROOM_CODE_RE = /^[A-Z0-9]{6}$/;
+const SHARE_TOKEN_RE = /^[A-Za-z0-9_-]{32,128}$/;
+const SHARE_DEFAULT_DAYS = 30;
+const ARENA_DURATION_MS = 60 * 60 * 1000;
 
+function arenaWindow(timeControl:string, now = new Date()) {
+  const slot = Math.floor(now.getTime() / ARENA_DURATION_MS) * ARENA_DURATION_MS;
+  const start = new Date(slot);
+  const end = new Date(slot + ARENA_DURATION_MS);
+  return { id:`${timeControl}-${start.toISOString().slice(0,13).replace(/[-:]/g,'')}`, label:`${timeControl} Arena · ${start.toISOString().slice(11,16)}–${end.toISOString().slice(11,16)} UTC`, start:start.toISOString(), end:end.toISOString() };
+}
+async function ensureArena(db:any,timeControl:string,now=new Date()) {
+  const a=arenaWindow(timeControl,now);
+  await db.prepare(`INSERT OR IGNORE INTO arena_events(id,label,time_control,starts_at,ends_at,status) VALUES(?,?,?,?,?,'active')`).bind(a.id,a.label,timeControl,a.start,a.end).run();
+  await finalizeArenaRewards(db,now);
+  return a;
+}
+
+async function finalizeArenaRewards(db:any,now=new Date()) {
+  const ended=(await db.prepare(`SELECT id,label,time_control,starts_at,ends_at FROM arena_events WHERE status='active' AND ends_at<=? ORDER BY ends_at ASC LIMIT 12`).bind(now.toISOString()).all<any>()).results||[];
+  for(const a of ended){
+    const rows=(await db.prepare(`SELECT ap.user_id,u.display_name,COALESCE(SUM(CASE WHEN ((g.white_user_id=ap.user_id AND g.result='1-0') OR (g.black_user_id=ap.user_id AND g.result='0-1')) THEN 2 WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) points,COUNT(g.id) games,COALESCE(SUM(CASE WHEN ((g.white_user_id=ap.user_id AND g.result='1-0') OR (g.black_user_id=ap.user_id AND g.result='0-1')) THEN 1 ELSE 0 END),0) wins,COALESCE(SUM(CASE WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) draws FROM arena_participants ap JOIN users u ON u.id=ap.user_id LEFT JOIN arena_participants op ON op.arena_id=ap.arena_id AND op.user_id<>ap.user_id LEFT JOIN games g ON g.status='finished' AND g.ended_at>=? AND g.ended_at<? AND ((g.white_user_id=ap.user_id AND g.black_user_id=op.user_id) OR (g.black_user_id=ap.user_id AND g.white_user_id=op.user_id)) AND g.ended_at>=ap.joined_at AND (ap.left_at IS NULL OR g.ended_at<=ap.left_at) AND g.ended_at>=op.joined_at AND (op.left_at IS NULL OR g.ended_at<=op.left_at) WHERE ap.arena_id=? GROUP BY ap.user_id ORDER BY points DESC,wins DESC,games DESC,u.rating DESC LIMIT 3`).bind(a.starts_at,a.ends_at,a.id).all<any>()).results||[];
+    for(let i=0;i<rows.length;i++){ const r=rows[i],rank=i+1,rewardKey=rank===1?'arena_champion':rank===2?'arena_runner_up':'arena_podium'; await db.prepare(`INSERT OR IGNORE INTO arena_rewards(id,arena_id,user_id,rank,reward_key,points,games,wins,draws,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`).bind(crypto.randomUUID(),a.id,r.user_id,rank,rewardKey,Number(r.points||0),Number(r.games||0),Number(r.wins||0),Number(r.draws||0),now.toISOString()).run(); }
+    await db.prepare(`UPDATE arena_events SET status='finished' WHERE id=? AND status='active'`).bind(a.id).run();
+  }
+}
+
+
+function cupWindow(kind:'daily'|'weekly', now=new Date()) {
+  const day=Math.floor(now.getTime()/86400000)*86400000;
+  const start=kind==='daily'?day:day-((new Date(day).getUTCDay()+6)%7)*86400000;
+  const end=start+(kind==='daily'?86400000:7*86400000);
+  const d=new Date(start); const id=`${kind}-${d.toISOString().slice(0,10)}`;
+  return {id,label:`${kind==='daily'?'Günlük':'Haftalık'} Cup · ${d.toISOString().slice(0,10)}`,start:new Date(start).toISOString(),end:new Date(end).toISOString()};
+}
+async function ensureCup(db:any,kind:'daily'|'weekly',now=new Date()) {
+  const c=cupWindow(kind,now);
+  await db.prepare(`INSERT OR IGNORE INTO cup_events(id,label,kind,starts_at,ends_at,status) VALUES(?,?,?,?,?,'active')`).bind(c.id,c.label,kind,c.start,c.end).run();
+  await finalizeCupRewards(db,now);
+  return c;
+}
+async function finalizeCupRewards(db:any,now=new Date()) {
+  const ended=(await db.prepare(`SELECT id,label,kind,starts_at,ends_at FROM cup_events WHERE status='active' AND ends_at<=? ORDER BY ends_at ASC LIMIT 8`).bind(now.toISOString()).all<any>()).results||[];
+  for(const c of ended){
+    const rows=(await db.prepare(`SELECT cp.user_id,u.display_name,COALESCE(SUM(CASE WHEN ((g.white_user_id=cp.user_id AND g.result='1-0') OR (g.black_user_id=cp.user_id AND g.result='0-1')) THEN 2 WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) points,COUNT(DISTINCT g.id) games,COALESCE(SUM(CASE WHEN ((g.white_user_id=cp.user_id AND g.result='1-0') OR (g.black_user_id=cp.user_id AND g.result='0-1')) THEN 1 ELSE 0 END),0) wins,COALESCE(SUM(CASE WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) draws FROM cup_participants cp JOIN users u ON u.id=cp.user_id LEFT JOIN cup_participants op ON op.cup_id=cp.cup_id AND op.user_id<>cp.user_id LEFT JOIN games g ON g.status='finished' AND g.ended_at>=? AND g.ended_at<? AND ((g.white_user_id=cp.user_id AND g.black_user_id=op.user_id) OR (g.black_user_id=cp.user_id AND g.white_user_id=op.user_id)) AND g.ended_at>=cp.joined_at AND (cp.left_at IS NULL OR g.ended_at<=cp.left_at) AND g.ended_at>=op.joined_at AND (op.left_at IS NULL OR g.ended_at<=op.left_at) WHERE cp.cup_id=? GROUP BY cp.user_id ORDER BY points DESC,wins DESC,games DESC,u.rating DESC LIMIT 3`).bind(c.starts_at,c.ends_at,c.id).all<any>()).results||[];
+    for(let i=0;i<rows.length;i++){const r=rows[i],rank=i+1,rewardKey=rank===1?'cup_champion':rank===2?'cup_runner_up':'cup_podium';await db.prepare(`INSERT OR IGNORE INTO cup_rewards(id,cup_id,user_id,rank,reward_key,points,games,wins,draws,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`).bind(crypto.randomUUID(),c.id,r.user_id,rank,rewardKey,Number(r.points||0),Number(r.games||0),Number(r.wins||0),Number(r.draws||0),now.toISOString()).run();}
+    await db.prepare(`UPDATE cup_events SET status='finished' WHERE id=? AND status='active'`).bind(c.id).run();
+  }
+}
+async function arenaJoinAllowed(db:any,userId:string,arenaId:string,now=new Date()) {
+  const since=new Date(now.getTime()-60*1000).toISOString();
+  const hour=new Date(now.getTime()-60*60*1000).toISOString();
+  const recent=await db.prepare(`SELECT action,created_at FROM arena_join_log WHERE user_id=? ORDER BY created_at DESC LIMIT 1`).bind(userId).first<any>();
+  if(recent?.action==='leave' && String(recent.created_at)>since) return {ok:false,error:'Arena’dan çıktıktan sonra 60 saniye beklemelisin.'};
+  const churn=await db.prepare(`SELECT COUNT(*) count FROM arena_join_log WHERE user_id=? AND action='join' AND created_at>=?`).bind(userId,hour).first<any>();
+  if(Number(churn?.count||0)>=8) return {ok:false,error:'Arena katılım limiti aşıldı. Bir saat içinde en fazla 8 yeniden katılım yapılabilir.'};
+  return {ok:true};
+}
+
+async function tournamentAfterGame(db:any,env:Env,gameId:string,result:string,now=new Date()) {
+  const m=await db.prepare(`SELECT id,tournament_id,round,match_no,player1_id,player2_id,status,game_id,tiebreak_game_id,tiebreak_mode,tiebreak_room_code FROM tournament_matches WHERE game_id=? OR tiebreak_game_id=? ORDER BY CASE WHEN tiebreak_game_id=? THEN 0 ELSE 1 END LIMIT 1`).bind(gameId,gameId,gameId).first<any>();
+  if(!m || m.status==='finished') return;
+  const isReplayGame=String(m.tiebreak_game_id||'')===String(gameId);
+  let winnerId=result==='1-0'?m.player1_id:result==='0-1'?m.player2_id:null;
+  let winnerReason=winnerId?'game_result':(isReplayGame?'draw_after_replay':'draw_seed_tiebreak');
+  if(!winnerId && !isReplayGame && String(m.tiebreak_mode||'seed')==='replay' && !m.tiebreak_room_code) {
+    const replayCode=tournamentRoomCode();
+    await db.prepare(`UPDATE tournament_matches SET tiebreak_room_code=?,tiebreak_mode='replay',tie_break='replay',winner_reason='pending_replay' WHERE id=? AND status<>'finished'`).bind(replayCode,m.id).run();
+    const names=await db.prepare(`SELECT id,display_name FROM users WHERE id IN (?,?)`).bind(m.player1_id,m.player2_id).all<any>();
+    const byId=new Map((names.results||[]).map((x:any)=>[x.id,x.display_name]));
+    for(const uid of [m.player1_id,m.player2_id]) if(uid) await notify(db,env,uid,'tournament_update','Tie-break maçı hazır',`Ana maç berabere bitti. Tie-break için ${byId.get(uid===m.player1_id?m.player2_id:m.player1_id)||'rakibin'} ile yeni odaya bağlanabilirsin.`,{tournamentId:m.tournament_id,matchId:m.id,roomCode:replayCode,round:Number(m.round),matchNo:Number(m.match_no),tieBreak:'replay'});
+    return;
+  }
+  if(!winnerId) {
+    const seeded=await db.prepare(`SELECT user_id,seed FROM tournament_players WHERE tournament_id=? AND user_id IN (?,?) ORDER BY CASE WHEN seed IS NULL THEN 999999 ELSE seed END ASC LIMIT 1`).bind(m.tournament_id,m.player1_id,m.player2_id).first<any>();
+    winnerId=seeded?.user_id||m.player1_id||m.player2_id;
+    winnerReason=isReplayGame?'draw_seed_after_replay':'draw_seed_tiebreak';
+  }
+  const finalTieBreak=winnerReason.includes('seed')?'seed':isReplayGame?'replay':'none';
+  await db.prepare(`UPDATE tournament_matches SET status='finished',winner_id=?,game_id=COALESCE(game_id,?),winner_reason=?,tie_break=? WHERE id=? AND status<>'finished'`).bind(winnerId,gameId,winnerReason,finalTieBreak,m.id).run();
+  if(!winnerId) return;
+  const next=await db.prepare(`SELECT id,round,match_no,player1_id,player2_id,status,room_code FROM tournament_matches WHERE tournament_id=? AND round=? AND match_no=?`).bind(m.tournament_id,Number(m.round)+1,Math.ceil(Number(m.match_no)/2)).first<any>();
+  if(next) {
+    const slot=Number(m.match_no)%2===1?'player1_id':'player2_id';
+    await db.prepare(`UPDATE tournament_matches SET ${slot}=? WHERE id=? AND status='ready'`).bind(winnerId,next.id).run();
+    const ready=await db.prepare(`SELECT player1_id,player2_id FROM tournament_matches WHERE id=?`).bind(next.id).first<any>();
+    if(ready?.player1_id && ready?.player2_id) {
+      await db.prepare(`UPDATE tournament_matches SET status='ready' WHERE id=?`).bind(next.id).run();
+      const names=await db.prepare(`SELECT id,display_name FROM users WHERE id IN (?,?)`).bind(ready.player1_id,ready.player2_id).all<any>();
+      const byId=new Map((names.results||[]).map((x:any)=>[x.id,x.display_name]));
+      const matchNo=Number(next.match_no);
+      for(const uid of [ready.player1_id,ready.player2_id]) await notify(db,env,uid,'tournament_update','Turnuva maçı hazır',`Sıradaki turnuva maçın hazır: ${byId.get(uid===ready.player1_id?ready.player2_id:ready.player1_id)||'rakibin'} ile karşılaşacaksın.`,{tournamentId:m.tournament_id,matchId:next.id,roomCode:next.room_code,round:Number(next.round),matchNo});
+    }
+  } else {
+    await db.prepare(`UPDATE tournaments SET status='finished',ends_at=? WHERE id=? AND status='active'`).bind(now.toISOString(),m.tournament_id).run();
+    const finalMatch=await db.prepare(`SELECT player1_id,player2_id,winner_id FROM tournament_matches WHERE id=?`).bind(m.id).first<any>();
+    const champion=finalMatch?.winner_id||winnerId;
+    const runner=champion===finalMatch?.player1_id?finalMatch?.player2_id:finalMatch?.player1_id;
+    if(champion) await db.prepare(`INSERT OR IGNORE INTO tournament_rewards(id,tournament_id,user_id,rank,reward_key,created_at) VALUES(?,?,?,?,?,?)`).bind(crypto.randomUUID(),m.tournament_id,champion,1,'tournament_champion',now.toISOString()).run();
+    if(runner) await db.prepare(`INSERT OR IGNORE INTO tournament_rewards(id,tournament_id,user_id,rank,reward_key,created_at) VALUES(?,?,?,?,?,?)`).bind(crypto.randomUUID(),m.tournament_id,runner,2,'tournament_runner_up',now.toISOString()).run();
+    if(champion) await notify(db,env,champion,'tournament_update','Turnuva şampiyonusun!','Finali kazandın ve turnuvayı şampiyon tamamladın.',{tournamentId:m.tournament_id,matchId:m.id,rank:1,gameId});
+    if(runner) await notify(db,env,runner,'tournament_update','Turnuva tamamlandı','Finalde ikinci oldun. Turnuva ödülün hesabına işlendi.',{tournamentId:m.tournament_id,matchId:m.id,rank:2,gameId});
+  }
+}
+function tournamentRoomCode(){ return crypto.randomUUID().replaceAll('-','').slice(0,6).toUpperCase(); }
+
+function shareToken(){
+  const bytes=new Uint8Array(32); crypto.getRandomValues(bytes);
+  let s=''; for(const b of bytes)s+=String.fromCharCode(b);
+  return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+async function sha256Hex(value:string){
+  const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest)).map(x=>x.toString(16).padStart(2,'0')).join('');
+}
+function htmlEscape(value:any){return String(value??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+function publicShareUrl(request:Request,token:string,matchId?:string,ply?:number){const u=new URL(request.url);u.pathname=`/share/tournament/${encodeURIComponent(token)}`;const q=new URLSearchParams();if(matchId)q.set('match',matchId);if(Number.isFinite(ply)&&Number(ply)>=0)q.set('ply',String(Math.floor(Number(ply))));u.search=q.toString()?`?${q.toString()}`:'';return u.toString();}
+async function allowPublicShareRequest(db:any,hash:string,now=new Date()){const minute=Math.floor(now.getTime()/60000);const bucket=new Date(minute*60000).toISOString();const row=await db.prepare(`SELECT hits FROM tournament_share_rate_limits WHERE token_hash=? AND window_start=?`).bind(hash,bucket).first<any>();const blocked=Number(row?.hits||0)>=60;await db.prepare(`INSERT INTO tournament_share_abuse_windows(token_hash,window_start,allowed_hits,blocked_hits,last_blocked_at) VALUES(?,?,?, ?, ?) ON CONFLICT(token_hash,window_start) DO UPDATE SET allowed_hits=allowed_hits+excluded.allowed_hits,blocked_hits=blocked_hits+excluded.blocked_hits,last_blocked_at=CASE WHEN excluded.blocked_hits>0 THEN excluded.last_blocked_at ELSE tournament_share_abuse_windows.last_blocked_at END`).bind(hash,bucket,blocked?0:1,blocked?1:0,blocked?now.toISOString():null).run();if(blocked)return false;await db.prepare(`INSERT INTO tournament_share_rate_limits(token_hash,window_start,hits) VALUES(?,?,1) ON CONFLICT(token_hash,window_start) DO UPDATE SET hits=hits+1`).bind(hash,bucket).run();return true;}
+function publicOgImageUrl(request:Request,token:string){const u=new URL(request.url);u.pathname=`/share/tournament/${encodeURIComponent(token)}/og.svg`;u.search='';return u.toString();}
+function html(body:string,status=200){return new Response(`<!doctype html><html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#090b10">${body}</body></html>`,{status,headers:{'content-type':'text/html; charset=utf-8','cache-control':'public, max-age=60'}});}
+async function recordShareCache(db:any,tournamentId:string,shareId:string,route:string,status:number){const day=new Date().toISOString().slice(0,10);const origin=status===200?1:0;const conditional=status===304?1:0;if(!origin&&!conditional)return;await db.prepare(`INSERT INTO tournament_share_cache_daily(day,tournament_id,share_id,route,origin_hits,conditional_hits) VALUES(?,?,?,?,?,?) ON CONFLICT(day,share_id,route) DO UPDATE SET origin_hits=origin_hits+excluded.origin_hits,conditional_hits=conditional_hits+excluded.conditional_hits`).bind(day,tournamentId,shareId,route,origin,conditional).run();}
+async function recordShareAlerts(db:any,tournamentId:string,shareId:string,alerts:string[]){const now=new Date().toISOString();for(const alert of alerts){await db.prepare(`INSERT INTO tournament_share_alert_history(id,tournament_id,share_id,alert,first_seen_at,last_seen_at,occurrences) VALUES(?,?,?,?,?,?,1) ON CONFLICT(share_id,alert) DO UPDATE SET last_seen_at=excluded.last_seen_at,occurrences=tournament_share_alert_history.occurrences+1`).bind(crypto.randomUUID(),tournamentId,shareId,alert,now,now).run();}}
+async function shareExportIntegrity(payload:any){return await sha256Hex(JSON.stringify(payload));}
+async function runShareMaintenance(db:any,now=new Date()){const iso=now.toISOString();const errors:any[]=[];const step=async(stage:string,fn:()=>Promise<any>)=>{try{return await fn()}catch(error){errors.push({stage,message:String(error instanceof Error?error.message:error).slice(0,240)});return {meta:{changes:0}};}}; const rate=await step('rate-limits',()=>db.prepare(`DELETE FROM tournament_share_rate_limits WHERE window_start < ?`).bind(new Date(now.getTime()-2*3600000).toISOString()).run()); const abuse=await step('abuse-windows',()=>db.prepare(`DELETE FROM tournament_share_abuse_windows WHERE window_start < ?`).bind(new Date(now.getTime()-24*3600000).toISOString()).run()); const agg=await step('audit-aggregate',()=>db.prepare(`INSERT INTO tournament_share_audit_daily(day,tournament_id,share_id,event,count) SELECT substr(created_at,1,10),tournament_id,share_id,event,COUNT(*) FROM tournament_share_audit WHERE created_at>=? GROUP BY substr(created_at,1,10),tournament_id,share_id,event ON CONFLICT(day,tournament_id,share_id,event) DO UPDATE SET count=excluded.count`).bind(new Date(now.getTime()-91*86400000).toISOString()).run()); const audit=await step('audit-retention',()=>db.prepare(`DELETE FROM tournament_share_audit WHERE created_at < ?`).bind(new Date(now.getTime()-90*86400000).toISOString()).run()); const cache=await step('cache-retention',()=>db.prepare(`DELETE FROM tournament_share_cache_daily WHERE day < ?`).bind(new Date(now.getTime()-90*86400000).toISOString().slice(0,10)).run()); const alerts=await step('alert-retention',()=>db.prepare(`DELETE FROM tournament_share_alert_history WHERE last_seen_at < ?`).bind(new Date(now.getTime()-180*86400000).toISOString()).run()); const runId=crypto.randomUUID(); const result={id:runId,ranAt:iso,retention:{auditDays:90,cacheDays:90,alertDays:180},status:errors.length?'partial':'ok',changes:{auditAggregated:Number(agg.meta?.changes||0),auditDeleted:Number(audit.meta?.changes||0),cacheDeleted:Number(cache.meta?.changes||0),alertsDeleted:Number(alerts.meta?.changes||0),rateLimitsDeleted:Number(rate.meta?.changes||0),abuseWindowsDeleted:Number(abuse.meta?.changes||0)},errors}; await step('maintenance-run-persist',()=>db.prepare(`INSERT INTO tournament_share_maintenance_runs(id,ran_at,audit_aggregated,audit_deleted,cache_deleted,alerts_deleted,rate_limits_deleted,abuse_windows_deleted) VALUES(?,?,?,?,?,?,?,?)`).bind(runId,iso,result.changes.auditAggregated,result.changes.auditDeleted,result.changes.cacheDeleted,result.changes.alertsDeleted,result.changes.rateLimitsDeleted,result.changes.abuseWindowsDeleted).run()); await step('maintenance-meta-persist',()=>db.prepare(`INSERT INTO tournament_share_maintenance_run_meta(run_id,status,error_count) VALUES(?,?,?) ON CONFLICT(run_id) DO UPDATE SET status=excluded.status,error_count=excluded.error_count`).bind(runId,result.status,errors.length).run())); for(const e of errors)await step('maintenance-error-persist',()=>db.prepare(`INSERT INTO tournament_share_maintenance_errors(id,run_id,stage,message,created_at) VALUES(?,?,?,?,?)`).bind(crypto.randomUUID(),runId,e.stage,e.message,iso).run()); await step('maintenance-retention',()=>db.prepare(`DELETE FROM tournament_share_maintenance_runs WHERE ran_at < ?`).bind(new Date(now.getTime()-90*86400000).toISOString()).run()); await step('maintenance-error-retention',()=>db.prepare(`DELETE FROM tournament_share_maintenance_errors WHERE created_at < ?`).bind(new Date(now.getTime()-90*86400000).toISOString()).run()); return result;}
+async function cachedHtml(request:Request,body:string,maxAge=60,etagSource:any=body){const etag='"'+await sha256Hex(typeof etagSource==='string'?etagSource:JSON.stringify(etagSource))+'"';const headers={"content-type":"text/html; charset=utf-8",etag,"cache-control":`public, max-age=${maxAge}, must-revalidate`};if(request.headers.get('if-none-match')===etag)return new Response(null,{status:304,headers:{...headers,"x-zato-cache":"conditional-hit"}});return new Response(body,{status:200,headers:{...headers,"x-zato-cache":"origin-miss"}});}
+async function logShareAudit(db:any,tournamentId:string,shareId:string,event:string,metadata:any={}){await db.prepare(`INSERT INTO tournament_share_audit(id,tournament_id,share_id,event,metadata,created_at) VALUES(?,?,?,?,?,?)`).bind(crypto.randomUUID(),tournamentId,shareId,event,JSON.stringify(metadata),new Date().toISOString()).run();}
+function sharePage(title:string,description:string,content:string,canonical:string,extra=''){
+  return `<!doctype html><html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#090b10"><title>${htmlEscape(title)}</title><meta name="description" content="${htmlEscape(description)}"><meta property="og:title" content="${htmlEscape(title)}"><meta property="og:description" content="${htmlEscape(description)}"><meta property="og:type" content="website"><meta property="og:url" content="${htmlEscape(canonical)}">${extra}</head><body style="margin:0;background:#090b10;color:#e9edf3;font-family:Inter,system-ui,sans-serif"><main style="max-width:980px;margin:0 auto;padding:32px 18px">${content}</main></body></html>`;
+}
 function json(data:unknown, init:ResponseInit={}) {
   return new Response(JSON.stringify(data), { ...init, headers:{'content-type':'application/json; charset=utf-8', ...(init.headers||{})} });
+}
+async function cachedJson(request:Request,data:unknown,maxAge=60,etagData:any=data){
+  const body=JSON.stringify(data);
+  const etag='"'+await sha256Hex(JSON.stringify(etagData))+'"';
+  if(request.headers.get('if-none-match')===etag) return new Response(null,{status:304,headers:{etag,'cache-control':`public, max-age=${maxAge}, must-revalidate`,'x-zato-cache':'conditional-hit'}});
+  return new Response(body,{status:200,headers:{'content-type':'application/json; charset=utf-8',etag,'cache-control':`public, max-age=${maxAge}, must-revalidate`,'x-zato-cache':'origin-miss'}});
 }
 function cookie(request:Request,name:string){ const raw=request.headers.get('Cookie')||''; return raw.split(';').map(v=>v.trim()).find(v=>v.startsWith(name+'='))?.slice(name.length+1)||null; }
 async function hashPassword(password:string,salt:string){ const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(password),'PBKDF2',false,['deriveBits']); const bits=await crypto.subtle.deriveBits({name:'PBKDF2',salt:new TextEncoder().encode(salt),iterations:120000,hash:'SHA-256'},key,256); return Array.from(new Uint8Array(bits)).map(x=>x.toString(16).padStart(2,'0')).join(''); }
 async function authUser(request:Request,env:Env){ if(!env.DB)return null; const sid=cookie(request,'zato_session'); if(!sid)return null; const row=await env.DB.prepare(`SELECT u.id,u.username,u.display_name,u.rating FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id=? AND s.expires_at>?`).bind(sid,new Date().toISOString()).first<any>(); return row||null; }
 function cookieHeaders(){ return 'Path=/; HttpOnly; Secure; SameSite=Lax'; }
 function elo(rA:number,rB:number,score:number){ const expected=1/(1+Math.pow(10,(rB-rA)/400)); return Math.round(rA+32*(score-expected)); }
+function classifyOpening(sans:string[]){
+  const key=sans.slice(0,12).join(' ');
+  const map:[RegExp,string,string][]=[
+    [/^e4 e5 Nf3 Nc6 Bb5/,'Ruy Lopez','C60'],[/^e4 e5 Nf3 Nc6 Bc4/,'Italian Game','C50'],
+    [/^e4 e5 Nf3 Nc6 d4/,'Scotch Game','C45'],[/^e4 e5 Nc3/,'Vienna Game','C25'],
+    [/^e4 e5 Nf3 Nf6/,'Petrov Defense','C42'],[/^e4 e5 f4/,'King’s Gambit','C30'],
+    [/^e4 c5 Nf3 d6 d4 cxd4/,'Sicilian Defense','B20'],[/^e4 c5 Nf3 Nc6 d4 cxd4/,'Sicilian Defense: Open','B30'],
+    [/^e4 c5 Nf3 e6 d4/,'Sicilian Defense: Paulsen','B40'],[/^e4 e6 d4 d5 Nc3 Nf6/,'French Defense','C00'],
+    [/^e4 c6 d4 d5 Nc3/,'Caro-Kann Defense','B10'],[/^e4 d5 exd5/,'Scandinavian Defense','B01'],
+    [/^e4 d6 d4 Nf6/,'Pirc Defense','B07'],[/^e4 g6 d4 Bg7/,'Modern Defense','B06'],
+    [/^d4 d5 c4/,'Queen’s Gambit','D06'],[/^d4 Nf6 c4 e6 Nc3 Bb4/,'Nimzo-Indian Defense','E20'],
+    [/^d4 Nf6 c4 g6 Nc3 d5/,'Grünfeld Defense','D80'],[/^d4 Nf6 c4 g6 Nc3 Bg7/,'King’s Indian Defense','E60'],
+    [/^d4 Nf6 c4 e6 Nf3 b6/,'Queen’s Indian Defense','E15'],[/^d4 f5/,'Dutch Defense','A80'],
+    [/^Nf3 d5 g3/,'Réti Opening','A05'],[/^c4 e5 Nc3 Nf6/,'English Opening','A20'],[/^c4 c5/,'English Opening','A30']
+  ];
+  for(const [re,name,eco] of map) if(re.test(key)) return {name,eco};
+  return {name:'Açılış tanımlanamadı',eco:null};
+}
+
+function b64urlBytes(bytes:ArrayBuffer|Uint8Array){ const b=bytes instanceof Uint8Array?bytes:new Uint8Array(bytes); let s=''; for(const x of b)s+=String.fromCharCode(x); return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
+function b64urlText(s:string){ return b64urlBytes(new TextEncoder().encode(s)); }
+function utf8(s:string){ return new TextEncoder().encode(s); }
+async function vapidToken(env:Env,audience:string){
+  if(!env.VAPID_PRIVATE_JWK || !env.VAPID_PUBLIC_KEY) return null;
+  const jwk=JSON.parse(env.VAPID_PRIVATE_JWK); const key=await crypto.subtle.importKey('jwk',jwk,{name:'ECDSA',namedCurve:'P-256'},false,['sign']);
+  const header=b64urlText(JSON.stringify({typ:'JWT',alg:'ES256'}));
+  const payload=b64urlText(JSON.stringify({aud:audience,exp:Math.floor(Date.now()/1000)+3600,sub:env.VAPID_SUBJECT||'mailto:admin@zatochess.local'}));
+  const sig=await crypto.subtle.sign({name:'ECDSA',hash:'SHA-256'},key,utf8(`${header}.${payload}`));
+  return `${header}.${payload}.${b64urlBytes(sig)}`;
+}
+async function sendBrowserPush(env:Env,userId:string,title:string,body:string){
+  if(!env.DB || !env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_JWK) return;
+  try {
+    const rows=await env.DB.prepare('SELECT id,endpoint FROM push_subscriptions WHERE user_id=?').bind(userId).all<any>();
+    for(const row of (rows.results||[])){
+      try {
+        const endpoint=String(row.endpoint); const audience=new URL(endpoint).origin; const token=await vapidToken(env,audience); if(!token) continue;
+        const r=await fetch(endpoint,{method:'POST',headers:{Authorization:`vapid t=${token}, k=${env.VAPID_PUBLIC_KEY}`,'TTL':'300','Urgency':'high'}});
+        if(r.status===404||r.status===410) await env.DB.prepare('DELETE FROM push_subscriptions WHERE id=?').bind(row.id).run();
+      } catch {}
+    }
+  } catch {}
+}
+
+async function notifyRealtime(env:Env,toUserId:string,event:unknown){ try { const id=env.SOCIAL.idFromName(toUserId); await env.SOCIAL.get(id).fetch('https://social.internal/push',{method:'POST',headers:{'content-type':'application/json','x-zato-user-id':toUserId},body:JSON.stringify(event)}); } catch {} }
+async function notify(db:D1Database,env:Env,toUserId:string,type:string,title:string,body:string,meta:Record<string,unknown>={}){ const allowed=['friend_request','friend_accepted','friend_declined','game_invite','game_result','rematch_request','rematch_accepted','rematch_declined','tournament_update']; const col=allowed.includes(type)?type:null; await db.prepare(`INSERT OR IGNORE INTO notification_preferences(user_id) VALUES(?)`).bind(toUserId).run(); if(col){ const pref=await db.prepare(`SELECT ${col} enabled,push_enabled FROM notification_preferences WHERE user_id=?`).bind(toUserId).first<any>(); if(pref && !Number(pref.enabled)) return; const id=crypto.randomUUID(); await db.prepare(`INSERT INTO notifications(id,user_id,type,title,body,payload_json) VALUES(?,?,?,?,?,?)`).bind(id,toUserId,type,title,body,JSON.stringify(meta)).run(); await notifyRealtime(env,toUserId,{type:'social:notification',notification:{id,user_id:toUserId,type,title,body,payload:meta,read_at:null,created_at:new Date().toISOString()}}); if(!pref || Number(pref.push_enabled)) void sendBrowserPush(env,toUserId,title,body); } }
 
 function resultForGame(game:Chess) {
   if (game.isCheckmate()) return game.turn()==='w' ? '0-1' : '1-0';
@@ -28,9 +208,382 @@ function resultForGame(game:Chess) {
   return '*';
 }
 
+function seasonInfo(now = new Date()) {
+  const year = now.getUTCFullYear();
+  const quarter = Math.floor(now.getUTCMonth() / 3) + 1;
+  const startMonth = (quarter - 1) * 3;
+  const start = new Date(Date.UTC(year, startMonth, 1));
+  const end = new Date(Date.UTC(year, startMonth + 3, 1));
+  return { id: `${year}-Q${quarter}`, start: start.toISOString(), end: end.toISOString(), label: `${year} Q${quarter}` };
+}
+function rankTier(rating:number) {
+  if (rating >= 2400) return {key:'grandmaster',label:'Grandmaster',min:2400};
+  if (rating >= 2200) return {key:'master',label:'Master',min:2200};
+  if (rating >= 2000) return {key:'diamond',label:'Diamond',min:2000};
+  if (rating >= 1800) return {key:'platinum',label:'Platinum',min:1800};
+  if (rating >= 1600) return {key:'gold',label:'Gold',min:1600};
+  if (rating >= 1400) return {key:'silver',label:'Silver',min:1400};
+  return {key:'bronze',label:'Bronze',min:0};
+}
+function tierMovement(startRating:number,currentRating:number){
+  const from=rankTier(startRating), to=rankTier(currentRating);
+  const order=['bronze','silver','gold','platinum','diamond','master','grandmaster'];
+  const delta=order.indexOf(to.key)-order.indexOf(from.key);
+  return {from,to,delta,label:delta>0?'Promosyon':delta<0?'Demotion':'Korundu'};
+}
+
+async function ensureSeasonLifecycle(db:any, current:any) {
+  await db.prepare(`INSERT OR IGNORE INTO seasons(id,label,starts_at,ends_at,status) VALUES(?,?,?,?, 'active')`).bind(current.id,current.label,current.start,current.end).run();
+  const previous=await db.prepare(`SELECT id FROM seasons WHERE ends_at<=? AND status='active' ORDER BY ends_at DESC LIMIT 1`).bind(current.start).first<any>();
+  if(previous){
+    const rows=(await db.prepare(`SELECT user_id,current_rating,games FROM season_player_stats WHERE season_id=? AND games>0 ORDER BY current_rating DESC,rating_delta DESC,games DESC LIMIT 3`).bind(previous.id).all()).results||[];
+    const rewards=rows.map((r:any,i:number)=>db.prepare(`INSERT OR IGNORE INTO season_rewards(season_id,user_id,rank,tier,reward_key) VALUES(?,?,?,?,?)`).bind(previous.id,r.user_id,i+1,rankTier(Number(r.current_rating)).key,i===0?'season_champion':i===1?'season_runner_up':'season_podium'));
+    if(rewards.length) await db.batch(rewards);
+    await db.prepare(`UPDATE seasons SET status='finalized',finalized_at=CURRENT_TIMESTAMP WHERE id=? AND status='active'`).bind(previous.id).run();
+  }
+}
+async function backfillSeason(db:any, season:any) {
+  const games=(await db.prepare(`SELECT id,white_user_id,black_user_id,result,ended_at FROM games WHERE status='finished' AND ended_at>=? AND ended_at<? AND result IN ('1-0','0-1','1/2-1/2') ORDER BY ended_at ASC LIMIT 500`).bind(season.start,season.end).all()).results||[];
+  for(const g of games){
+    const players=[{id:g.white_user_id,win:g.result==='1-0',loss:g.result==='0-1'},{id:g.black_user_id,win:g.result==='0-1',loss:g.result==='1-0'}];
+    for(const p of players){ if(!p.id) continue; const exists=await db.prepare(`SELECT 1 FROM season_game_results WHERE season_id=? AND game_id=? AND user_id=?`).bind(season.id,g.id,p.id).first(); if(exists) continue; const rh=await db.prepare(`SELECT old_rating,new_rating FROM rating_history WHERE game_id=? AND user_id=? LIMIT 1`).bind(g.id,p.id).first<any>(); if(!rh) continue; const res=g.result==='1/2-1/2'?'D':p.win?'W':'L'; await db.batch([db.prepare(`INSERT OR IGNORE INTO season_game_results(season_id,game_id,user_id,result,rating_before,rating_after) VALUES(?,?,?,?,?,?)`).bind(season.id,g.id,p.id,res,Number(rh.old_rating),Number(rh.new_rating)),db.prepare(`INSERT OR IGNORE INTO season_player_stats(season_id,user_id,games,wins,draws,losses,start_rating,current_rating,peak_rating,rating_delta) VALUES(?,?,?,?,?,?,?,?,?,?)`).bind(season.id,p.id,1,p.win?1:0,g.result==='1/2-1/2'?1:0,p.loss?1:0,Number(rh.old_rating),Number(rh.new_rating),Number(rh.new_rating),Number(rh.new_rating)-Number(rh.old_rating))]); }
+  }
+}
+
 export default {
+  async scheduled(_event:ScheduledEvent, env:Env, ctx:ExecutionContext):Promise<void> {
+    if(!env.DB) return; ctx.waitUntil((async()=>{ try { await runShareMaintenance(env.DB!); await finalizeArenaRewards(env.DB!); await finalizeCupRewards(env.DB!); const now=new Date(); for(const tc of Object.keys(TIME_CONTROLS)) await ensureArena(env.DB!,tc,now); await ensureCup(env.DB!,'daily',now); await ensureCup(env.DB!,'weekly',now); } catch {} })());
+  },
   async fetch(request:Request, env:Env):Promise<Response> {
     const url = new URL(request.url);
+    const publicShareMatch=url.pathname.match(/^\/api\/public\/tournaments\/([^/]+)$/);
+    if(publicShareMatch && request.method==='GET'){
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503});
+      try{
+        const token=decodeURIComponent(publicShareMatch[1]); if(!SHARE_TOKEN_RE.test(token))return json({error:'Geçersiz paylaşım bağlantısı.'},{status:404});
+        const hash=await sha256Hex(token);
+        if(!(await allowPublicShareRequest(env.DB,hash)))return json({error:'Public paylaşım için geçici erişim sınırına ulaşıldı.'},{status:429,headers:{'retry-after':'60'}});
+        const share=await env.DB.prepare(`SELECT id,tournament_id,views_count FROM tournament_shares WHERE token_hash=? AND revoked_at IS NULL AND visibility='public' AND (expires_at IS NULL OR expires_at>?)`).bind(hash,new Date().toISOString()).first<any>();
+        if(!share)return json({error:'Paylaşım bağlantısı bulunamadı veya iptal edilmiş.'},{status:404});
+        const t=await env.DB.prepare(`SELECT t.id,t.name,t.time_control,t.max_players,t.status,t.tiebreak_mode,t.created_at,t.starts_at,t.ends_at,u.display_name creator_name FROM tournaments t JOIN users u ON u.id=t.created_by WHERE t.id=?`).bind(share.tournament_id).first<any>();
+        if(!t)return json({error:'Turnuva bulunamadı.'},{status:404});
+        const players=(await env.DB.prepare(`SELECT tp.user_id,tp.seed,tp.rating_at_entry,u.display_name FROM tournament_players tp JOIN users u ON u.id=tp.user_id WHERE tp.tournament_id=? ORDER BY tp.seed,tp.joined_at`).bind(t.id).all<any>()).results||[];
+        const matches=(await env.DB.prepare(`SELECT m.id,m.round,m.match_no,m.player1_id,m.player2_id,m.game_id,m.tiebreak_game_id,m.winner_id,m.tie_break,m.winner_reason,m.status,u1.display_name player1_name,u2.display_name player2_name,uw.display_name winner_name FROM tournament_matches m LEFT JOIN users u1 ON u1.id=m.player1_id LEFT JOIN users u2 ON u2.id=m.player2_id LEFT JOIN users uw ON uw.id=m.winner_id WHERE m.tournament_id=? ORDER BY m.round,m.match_no`).bind(t.id).all<any>()).results||[];
+        const rewards=(await env.DB.prepare(`SELECT tr.rank,tr.reward_key,u.display_name FROM tournament_rewards tr JOIN users u ON u.id=tr.user_id WHERE tr.tournament_id=? ORDER BY tr.rank`).bind(t.id).all<any>()).results||[];
+        const champion=rewards.find((r:any)=>Number(r.rank)===1)?.display_name||null;
+        const completed=matches.filter((m:any)=>m.status==='finished').length;
+        const viewCount=Number(share.views_count||0); const payload={share:{title:`${t.name} · ZATO Chess`,status:t.status,players:players.length,maxPlayers:t.max_players,champion,views:viewCount+1},tournament:t,players,matches,rewards,completedMatches:completed}; const etagPayload={...payload,share:{...payload.share,views:0}}; const response=await cachedJson(request,payload,60,etagPayload); await recordShareCache(env.DB,share.tournament_id,share.id,'tournament-json',response.status); if(response.status===200){await env.DB.prepare(`UPDATE tournament_shares SET views_count=views_count+1,last_viewed_at=? WHERE token_hash=? AND revoked_at IS NULL AND visibility='public' AND (expires_at IS NULL OR expires_at>?)`).bind(new Date().toISOString(),hash,new Date().toISOString()).run(); await env.DB.prepare(`INSERT INTO tournament_share_daily(share_id,day,views) SELECT id,?,1 FROM tournament_shares WHERE token_hash=? ON CONFLICT(share_id,day) DO UPDATE SET views=views+1`).bind(new Date().toISOString().slice(0,10),hash).run();} return response;
+      }catch{return json({error:'Public turnuva sonucu yüklenemedi.'},{status:400});}
+    }
+    const publicReplayMatch=url.pathname.match(/^\/api\/public\/tournaments\/([^/]+)\/replay\/([^/]+)$/);
+    if(publicReplayMatch && request.method==='GET'){
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503});
+      try{
+        const token=decodeURIComponent(publicReplayMatch[1]),gameId=decodeURIComponent(publicReplayMatch[2]); if(!SHARE_TOKEN_RE.test(token))return json({error:'Geçersiz paylaşım bağlantısı.'},{status:404});
+        const hash=await sha256Hex(token); if(!(await allowPublicShareRequest(env.DB,hash)))return json({error:'Public replay için geçici erişim sınırına ulaşıldı.'},{status:429,headers:{'retry-after':'60'}}); const share=await env.DB.prepare(`SELECT id,tournament_id FROM tournament_shares WHERE token_hash=? AND revoked_at IS NULL AND visibility='public' AND (expires_at IS NULL OR expires_at>?)`).bind(hash,new Date().toISOString()).first<any>(); if(!share)return json({error:'Paylaşım bağlantısı bulunamadı.'},{status:404});
+        const match=await env.DB.prepare(`SELECT m.id,m.tournament_id,m.round,m.match_no,m.game_id,m.tiebreak_game_id,m.winner_id,m.tie_break,m.winner_reason,m.status,u1.display_name player1_name,u2.display_name player2_name FROM tournament_matches m LEFT JOIN users u1 ON u1.id=m.player1_id LEFT JOIN users u2 ON u2.id=m.player2_id WHERE m.tournament_id=? AND (m.game_id=? OR m.tiebreak_game_id=?)`).bind(share.tournament_id,gameId,gameId).first<any>(); if(!match)return json({error:'Bu maç bu turnuvanın paylaşımında bulunamadı.'},{status:404});
+        const game=await env.DB.prepare(`SELECT id,white_user_id,black_user_id,result,pgn,started_at,ended_at,time_control,status FROM games WHERE id=? AND status='finished'`).bind(gameId).first<any>(); if(!game)return json({error:'Maç kaydı bulunamadı.'},{status:404});
+        const moves=(await env.DB.prepare(`SELECT ply,uci,san,fen FROM moves WHERE game_id=? ORDER BY ply`).bind(gameId).all<any>()).results||[]; const requestedPly=Math.max(0,Math.min(moves.length,Number(new URL(request.url).searchParams.get('ply')||moves.length)));
+        return cachedJson(request,{match,game,moves,selectedPly:Number.isFinite(requestedPly)?requestedPly:moves.length},300);
+      }catch{return json({error:'Replay yüklenemedi.'},{status:400});}
+    }
+    const publicOgMatch=url.pathname.match(/^\/share\/tournament\/([^/]+)\/og\.svg$/);
+    if(publicOgMatch && request.method==='GET'){
+      if(!env.DB)return new Response('D1 yapılandırılmamış.',{status:503});
+      try{const token=decodeURIComponent(publicOgMatch[1]); if(!SHARE_TOKEN_RE.test(token))return new Response('Not found',{status:404}); const hash=await sha256Hex(token); if(!(await allowPublicShareRequest(env.DB,hash)))return new Response('Too Many Requests',{status:429,headers:{'retry-after':'60'}}); const share=await env.DB.prepare(`SELECT id,tournament_id FROM tournament_shares WHERE token_hash=? AND revoked_at IS NULL AND visibility='public' AND (expires_at IS NULL OR expires_at>?)`).bind(hash,new Date().toISOString()).first<any>(); if(!share)return new Response('Not found',{status:404}); const t=await env.DB.prepare(`SELECT name,status FROM tournaments WHERE id=?`).bind(share.tournament_id).first<any>(); if(!t)return new Response('Not found',{status:404}); const rewards=(await env.DB.prepare(`SELECT tr.rank,u.display_name FROM tournament_rewards tr JOIN users u ON u.id=tr.user_id WHERE tr.tournament_id=? ORDER BY tr.rank LIMIT 1`).bind(share.tournament_id).all<any>()).results||[]; const champ=rewards[0]?.display_name||''; const svg=`<svg xmlns="http://www.w3.org/2000/svg" width=1200 height=630 viewBox="0 0 1200 630"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#111827"/><stop offset="1" stop-color="#090b10"/></linearGradient></defs><rect width="1200" height="630" fill="url(#g)"/><rect x="52" y="52" width="1096" height="526" rx="28" fill="none" stroke="#303744"/><text x="90" y="125" fill="#8ab4ff" font-family="Arial,sans-serif" font-size="28" font-weight="700">ZATO CHESS · PUBLIC TOURNAMENT</text><text x="90" y="230" fill="#f1f5f9" font-family="Arial,sans-serif" font-size="58" font-weight="700">${htmlEscape(String(t.name).slice(0,34))}</text><text x="90" y="300" fill="#aeb7c5" font-family="Arial,sans-serif" font-size="30">${htmlEscape(String(t.status).toUpperCase())}</text>${champ?`<text x="90" y="390" fill="#fbbf24" font-family="Arial,sans-serif" font-size="34">🏆 ${htmlEscape(champ)}</text>`:''}<text x="90" y="520" fill="#64748b" font-family="Arial,sans-serif" font-size="24">zato chess</text></svg>`; const svgEtag='\"'+await sha256Hex(svg)+'\"'; if(request.headers.get('if-none-match')===svgEtag){const response=new Response(null,{status:304,headers:{etag:svgEtag,'cache-control':'public, max-age=300, must-revalidate','x-zato-cache':'conditional-hit'}});await recordShareCache(env.DB,share.tournament_id,share.id,'og-image',response.status);return response;} const response=new Response(svg,{headers:{'content-type':'image/svg+xml; charset=utf-8','cache-control':'public, max-age=300, must-revalidate',etag:svgEtag,'x-zato-cache':'origin-miss'}});await recordShareCache(env.DB,share.tournament_id,share.id,'og-image',response.status);return response;}catch{return new Response('Not found',{status:404});}
+    }
+    const publicSharePage=url.pathname.match(/^\/share\/tournament\/([^/]+)$/);
+    if(publicSharePage && request.method==='GET'){
+      if(!env.DB)return html('<title>ZATO Chess</title><p>D1 yapılandırılmamış.</p>',503);
+      try{
+        const token=decodeURIComponent(publicSharePage[1]); if(!SHARE_TOKEN_RE.test(token))return html('<title>Geçersiz paylaşım</title><p>Geçersiz paylaşım bağlantısı.</p>',404);
+        const hash=await sha256Hex(token); if(!(await allowPublicShareRequest(env.DB,hash)))return html('<title>Çok fazla istek</title><p>Public paylaşım için geçici erişim sınırına ulaşıldı. Lütfen biraz sonra tekrar dene.</p>',429); const share=await env.DB.prepare(`SELECT id,tournament_id,views_count,expires_at FROM tournament_shares WHERE token_hash=? AND revoked_at IS NULL AND visibility='public' AND (expires_at IS NULL OR expires_at>?)`).bind(hash,new Date().toISOString()).first<any>(); if(!share)return html('<title>Paylaşım bulunamadı</title><p>Paylaşım bağlantısı bulunamadı veya iptal edilmiş.</p>',404); const t=await env.DB.prepare(`SELECT t.*,u.display_name creator_name FROM tournaments t JOIN users u ON u.id=t.created_by WHERE t.id=?`).bind(share.tournament_id).first<any>(); if(!t)return html('<title>Turnuva bulunamadı</title><p>Turnuva bulunamadı.</p>',404);
+        const players=(await env.DB.prepare(`SELECT tp.user_id,tp.seed,tp.rating_at_entry,u.display_name FROM tournament_players tp JOIN users u ON u.id=tp.user_id WHERE tp.tournament_id=? ORDER BY tp.seed,tp.joined_at`).bind(t.id).all<any>()).results||[];
+        const matches=(await env.DB.prepare(`SELECT m.id,m.round,m.match_no,m.player1_id,m.player2_id,m.game_id,m.tiebreak_game_id,m.winner_id,m.tie_break,m.winner_reason,m.status,u1.display_name player1_name,u2.display_name player2_name,uw.display_name winner_name FROM tournament_matches m LEFT JOIN users u1 ON u1.id=m.player1_id LEFT JOIN users u2 ON u2.id=m.player2_id LEFT JOIN users uw ON uw.id=m.winner_id WHERE m.tournament_id=? ORDER BY m.round,m.match_no`).bind(t.id).all<any>()).results||[];
+        const rewards=(await env.DB.prepare(`SELECT tr.rank,tr.reward_key,u.display_name FROM tournament_rewards tr JOIN users u ON u.id=tr.user_id WHERE tr.tournament_id=? ORDER BY tr.rank`).bind(t.id).all<any>()).results||[];
+        const selected=new URL(request.url).searchParams.get('match'); const selectedPlyRaw=Number(new URL(request.url).searchParams.get('ply')||''); const selectedPly=Number.isFinite(selectedPlyRaw)?Math.max(0,Math.floor(selectedPlyRaw)):undefined; const selectedMatch=selected?matches.find((m:any)=>m.id===selected):null;
+        const champion=rewards.find((r:any)=>Number(r.rank)===1)?.display_name||null;
+        const description=`${t.name} · ${players.length}/${t.max_players} oyuncu · ${matches.filter((m:any)=>m.status==='finished').length} tamamlanan maç${champion?` · Şampiyon: ${champion}`:''}`;
+        const rows=matches.map((m:any)=>{const p1=htmlEscape(m.player1_name||'Bekliyor'),p2=htmlEscape(m.player2_name||'Bekliyor');const result=m.status==='finished'?(m.winner_id?htmlEscape(m.winner_name||'Kazanan'):'Tie-break'):(m.status==='live'?'CANLI':'Hazır');const replay=m.game_id?`<a href="${htmlEscape(publicShareUrl(request,token,m.id,0))}" style="color:#8ab4ff">Maç</a>`:'';return `<tr><td>R${m.round} / ${m.match_no}</td><td>${p1}</td><td>${p2}</td><td>${result}</td><td>${replay}</td></tr>`}).join('');
+        let replayHtml='';
+        if(selectedMatch){const gid=selectedMatch.game_id||selectedMatch.tiebreak_game_id; if(gid){const game=await env.DB.prepare(`SELECT id,result,pgn,started_at,ended_at,time_control,status FROM games WHERE id=? AND status='finished'`).bind(gid).first<any>(); const moves=(await env.DB.prepare(`SELECT ply,san,fen FROM moves WHERE game_id=? ORDER BY ply`).bind(gid).all<any>()).results||[]; if(game){const moveJson=JSON.stringify(moves.map((x:any)=>({ply:x.ply,san:x.san,fen:x.fen}))).replace(/</g,'\u003c'); replayHtml=`<section style="margin-top:24px;padding:16px;border:1px solid #262c36;border-radius:12px;background:#10141b"><h2 style="margin:0 0 8px">Replay · R${selectedMatch.round}/${selectedMatch.match_no}</h2><p>${htmlEscape(selectedMatch.player1_name||'Beyaz')} — ${htmlEscape(selectedMatch.player2_name||'Siyah')} · ${htmlEscape(game.result||'')}</p><div id="zato-replay" style="display:grid;grid-template-columns:minmax(260px,480px) 1fr;gap:18px;align-items:start"><div><div id="zato-board" style="display:grid;grid-template-columns:repeat(8,1fr);aspect-ratio:1;border:2px solid #303744;overflow:hidden"></div><div style="display:flex;gap:8px;margin-top:10px"><button id="zprev">←</button><button id="znext">→</button><span id="zlabel" style="padding:6px 0;opacity:.75"></span></div></div><div><pre style="white-space:pre-wrap;line-height:1.55;max-height:360px;overflow:auto">${htmlEscape(moves.map((x:any)=>`${x.ply}. ${x.san}`).join(' '))}</pre><details><summary>PGN</summary><pre style="white-space:pre-wrap">${htmlEscape(game.pgn||'')}</pre></details></div></div><script>(function(){const ms=${moveJson};const b=document.getElementById('zato-board'),lab=document.getElementById('zlabel');let i=${selectedPly!=null?'Math.min('+selectedPly+',ms.length-1)':'ms.length-1'};const pc={K:'♔',Q:'♕',R:'♖',B:'♗',N:'♘',P:'♙',k:'♚',q:'♛',r:'♜',b:'♝',n:'♞',p:'♟'};function draw(){const fen=i>=0&&ms[i]?.fen?ms[i].fen:'8/8/8/8/8/8/8/8';const rows=fen.split(' ')[0].split('/');b.innerHTML='';rows.forEach((row,ri)=>{let ci=0;for(const c of row){if(/[1-8]/.test(c)){ci+=Number(c)}else{const e=document.createElement('div');e.style.cssText='display:flex;align-items:center;justify-content:center;font-size:clamp(22px,5vw,42px);background:'+((ri+ci)%2?'#b8c0cc':'#eef1f5')+';color:'+(c===c.toUpperCase()?'#111827':'#475569');e.textContent=pc[c]||'';b.appendChild(e);ci++}}});lab.textContent=i<0?'Başlangıç':((ms[i]?.ply||0)+'. '+(ms[i]?.san||''));}document.getElementById('zprev').onclick=()=>{if(i>=0)i--;draw()};document.getElementById('znext').onclick=()=>{if(i<ms.length-1)i++;draw()};document.addEventListener('keydown',e=>{if(e.key==='ArrowLeft'){if(i>=0)i--;draw()}else if(e.key==='ArrowRight'){if(i<ms.length-1)i++;draw()}else if(e.key===' '){e.preventDefault();auto()}});let timer=null;const auto=()=>{if(timer){clearInterval(timer);timer=null;return}timer=setInterval(()=>{if(i>=ms.length-1){clearInterval(timer);timer=null;return}i++;draw()},1200)};const ab=document.createElement('button');ab.textContent='▶ Otomatik';ab.onclick=auto;document.getElementById('znext').after(ab);draw()})()</script></section>`;}}}
+        const content=`<div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap"><div><div style="font-size:12px;opacity:.65">ZATO CHESS · PUBLIC TOURNAMENT</div><h1 style="margin:6px 0">${htmlEscape(t.name)}</h1><p style="opacity:.8">${htmlEscape(description)}</p></div><div style="padding:10px 14px;border:1px solid #2b3039;border-radius:10px">${htmlEscape(t.status.toUpperCase())}</div></div><section style="margin-top:20px;overflow:auto"><table style="width:100%;border-collapse:collapse"><thead><tr><th style="text-align:left;padding:9px;border-bottom:1px solid #262c36">Tur</th><th style="text-align:left;padding:9px;border-bottom:1px solid #262c36">Oyuncu 1</th><th style="text-align:left;padding:9px;border-bottom:1px solid #262c36">Oyuncu 2</th><th style="text-align:left;padding:9px;border-bottom:1px solid #262c36">Durum</th><th style="text-align:left;padding:9px;border-bottom:1px solid #262c36">Replay</th></tr></thead><tbody>${rows}</tbody></table></section>${champion?`<p style="margin-top:18px"><b>Şampiyon:</b> ${htmlEscape(champion)}</p>`:''}${replayHtml}<p style="margin-top:28px;opacity:.6;font-size:12px">Bu sayfa salt okunurdur. Paylaşım tokenı özel hesap verilerini veya oyun oynama yetkisini açmaz.</p>`;
+        const page=sharePage(`${t.name} · ZATO Chess`,`ZATO Chess turnuva sonucu · ${description}`,content,publicShareUrl(request,token,selectedMatch?.id,selectedMatch?selectedPly:undefined),`<meta property="og:image" content="${htmlEscape(publicOgImageUrl(request,token))}"><meta name="twitter:card" content="summary_large_image">`); const response=await cachedHtml(request,page,60); await recordShareCache(env.DB,share.tournament_id,share.id,'html',response.status); if(response.status===200){await env.DB.prepare(`UPDATE tournament_shares SET views_count=views_count+1,last_viewed_at=? WHERE token_hash=? AND revoked_at IS NULL AND visibility='public' AND (expires_at IS NULL OR expires_at>?)`).bind(new Date().toISOString(),hash,new Date().toISOString()).run(); await env.DB.prepare(`INSERT INTO tournament_share_daily(share_id,day,views) SELECT id,?,1 FROM tournament_shares WHERE token_hash=? ON CONFLICT(share_id,day) DO UPDATE SET views=views+1`).bind(new Date().toISOString().slice(0,10),hash).run();} return response;
+      }catch{return html('<title>Paylaşım yüklenemedi</title><p>Turnuva paylaşımı yüklenemedi.</p>',400);}
+    }
+    if (url.pathname === '/api/notification-preferences' && request.method === 'GET') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      await env.DB.prepare(`INSERT OR IGNORE INTO notification_preferences(user_id) VALUES(?)`).bind(user.id).run(); const preferences=await env.DB.prepare(`SELECT friend_request,friend_accepted,friend_declined,game_invite,game_result,rematch_request,rematch_accepted,rematch_declined,tournament_update,push_enabled FROM notification_preferences WHERE user_id=?`).bind(user.id).first<any>(); return json({preferences});
+    }
+    if (url.pathname === '/api/notification-preferences' && request.method === 'POST') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try { const b=await request.json() as any; await env.DB.prepare(`INSERT OR IGNORE INTO notification_preferences(user_id) VALUES(?)`).bind(user.id).run(); const allowed=['friend_request','friend_accepted','friend_declined','game_invite','game_result','rematch_request','rematch_accepted','rematch_declined','tournament_update','push_enabled']; for(const k of allowed) if(typeof b[k]==='boolean') await env.DB.prepare(`UPDATE notification_preferences SET ${k}=? WHERE user_id=?`).bind(b[k]?1:0,user.id).run(); const preferences=await env.DB.prepare(`SELECT friend_request,friend_accepted,friend_declined,game_invite,game_result,rematch_request,rematch_accepted,rematch_declined,tournament_update,push_enabled FROM notification_preferences WHERE user_id=?`).bind(user.id).first<any>(); return json({ok:true,preferences}); } catch { return json({error:'Tercihler kaydedilemedi.'},{status:400}); }
+    }
+    if (url.pathname === '/api/push/config' && request.method === 'GET') {
+      return json({enabled:Boolean(env.VAPID_PUBLIC_KEY),publicKey:env.VAPID_PUBLIC_KEY||null});
+    }
+    if (url.pathname === '/api/push/subscribe' && request.method === 'POST') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try { const body=await request.json() as any; const endpoint=String(body.endpoint||''); const p256dh=String(body.keys?.p256dh||''); const auth=String(body.keys?.auth||''); if(!endpoint||!p256dh||!auth)return json({error:'Geçersiz push aboneliği.'},{status:400});
+        await env.DB.prepare(`INSERT INTO push_subscriptions(id,user_id,endpoint,p256dh,auth) VALUES(?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth,updated_at=CURRENT_TIMESTAMP`).bind(crypto.randomUUID(),user.id,endpoint,p256dh,auth).run(); return json({ok:true});
+      } catch { return json({error:'Push aboneliği kaydedilemedi.'},{status:400}); }
+    }
+    if (url.pathname === '/api/push/subscribe' && request.method === 'DELETE') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try { const body=await request.json() as any; await env.DB.prepare('DELETE FROM push_subscriptions WHERE endpoint=? AND user_id=?').bind(String(body.endpoint||''),user.id).run(); return json({ok:true}); } catch { return json({error:'Push aboneliği silinemedi.'},{status:400}); }
+    }
+    if (url.pathname === '/api/system/smoke' && request.method === 'GET') {
+      if(!env.DB) return json({ok:false,error:'D1 yapılandırılmamış.'},{status:503});
+      const user=await authUser(request,env); if(!user)return json({ok:false,error:'Giriş gerekli.'},{status:401});
+      const checks:any[]=[];
+      const tableNames=['users','games','moves','analyses','sessions','friendships','notifications','notification_preferences','push_subscriptions','rating_history','season_player_stats','seasons','season_game_results','season_rewards','matchmaking_queue','arena_events','arena_participants','arena_join_log','cup_events','cup_participants','cup_rewards','tournaments','tournament_players','tournament_matches','tournament_rewards','tournament_shares','tournament_share_rate_limits','tournament_share_daily','tournament_share_abuse_windows','tournament_share_audit','tournament_share_audit_daily','tournament_share_cache_daily','tournament_share_alert_history'];
+      try { const r=await env.DB.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name IN (${tableNames.map(()=>'?').join(',')})`).bind(...tableNames).all<any>(); const have=new Set((r.results||[]).map((x:any)=>x.name)); for(const name of tableNames)checks.push({name:`table:${name}`,ok:have.has(name)}); } catch(e){ checks.push({name:'tables',ok:false,error:String(e)}); }
+      try { const c=await env.DB.prepare(`SELECT COUNT(*) count FROM analyses WHERE loss_cp IS NOT NULL`).first<any>(); checks.push({name:'analysis-loss-cp',ok:true,value:Number(c?.count||0)}); } catch(e){ checks.push({name:'analysis-loss-cp',ok:false,error:String(e)}); }
+      try { const s=seasonInfo(); await ensureSeasonLifecycle(env.DB,s); const row=await env.DB.prepare(`SELECT id,status FROM seasons WHERE id=?`).bind(s.id).first<any>(); checks.push({name:'season-lifecycle',ok:Boolean(row&&row.id===s.id&&row.status==='active'),value:row||null}); } catch(e){ checks.push({name:'season-lifecycle',ok:false,error:String(e)}); }
+      try { const row=await env.DB.prepare(`SELECT id,rating FROM users WHERE id=?`).bind(user.id).first<any>(); checks.push({name:'leaderboard-query',ok:Boolean(row)}); } catch(e){ checks.push({name:'leaderboard-query',ok:false,error:String(e)}); }
+      try { const a=await env.DB.prepare(`SELECT COUNT(*) count FROM arena_events WHERE status='active' AND ends_at>?`).bind(new Date().toISOString()).first<any>(); checks.push({name:'arena-lifecycle',ok:Number(a?.count||0)>=0,value:Number(a?.count||0)}); } catch(e){ checks.push({name:'arena-lifecycle',ok:false,error:String(e)}); }
+      try { const c=await env.DB.prepare(`SELECT COUNT(*) count FROM arena_rewards`).first<any>(); checks.push({name:'arena-rewards',ok:true,value:Number(c?.count||0)}); } catch(e){ checks.push({name:'arena-rewards',ok:false,error:String(e)}); }
+      try { const t=await env.DB.prepare(`SELECT COUNT(*) count FROM tournaments WHERE status IN ('registration','active')`).first<any>(); checks.push({name:'tournament-lifecycle',ok:Number(t?.count||0)>=0,value:Number(t?.count||0)}); } catch(e){ checks.push({name:'tournament-lifecycle',ok:false,error:String(e)}); }
+      checks.push({name:'binding:ROOMS',ok:Boolean(env.ROOMS)}); checks.push({name:'binding:SOCIAL',ok:Boolean(env.SOCIAL)}); checks.push({name:'binding:MATCHMAKING',ok:Boolean(env.MATCHMAKING)}); checks.push({name:'push-config',ok:Boolean(env.VAPID_PUBLIC_KEY&&env.VAPID_PRIVATE_JWK&&env.VAPID_SUBJECT),configured:Boolean(env.VAPID_PUBLIC_KEY&&env.VAPID_PRIVATE_JWK&&env.VAPID_SUBJECT)});
+      const ok=checks.every((x:any)=>x.ok); return json({ok,version:'63.0.0',checkedAt:new Date().toISOString(),checks});
+    }
+    if (url.pathname === '/api/system/metrics' && request.method === 'GET') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try {
+        const [active,waiting,games24,arenaGames24,users,activeTournaments]=await Promise.all([
+          env.DB.prepare(`SELECT COUNT(*) count FROM arena_events WHERE status='active' AND ends_at>?`).bind(new Date().toISOString()).first<any>(),
+          env.DB.prepare(`SELECT COUNT(*) count FROM matchmaking_queue WHERE status='waiting'`).first<any>(),
+          env.DB.prepare(`SELECT COUNT(*) count FROM games WHERE status='finished' AND ended_at>=datetime('now','-24 hours')`).first<any>(),
+          env.DB.prepare(`SELECT COUNT(DISTINCT g.id) count FROM games g JOIN arena_participants ap ON (ap.user_id=g.white_user_id OR ap.user_id=g.black_user_id) JOIN arena_events ae ON ae.id=ap.arena_id WHERE g.status='finished' AND g.ended_at>=datetime('now','-24 hours') AND g.ended_at>=ap.joined_at AND (ap.left_at IS NULL OR g.ended_at<=ap.left_at)`).first<any>(),
+          env.DB.prepare(`SELECT COUNT(*) count FROM users`).first<any>(),
+          env.DB.prepare(`SELECT COUNT(*) count FROM tournaments WHERE status='active'`).first<any>()
+        ]);
+        const cups=await env.DB.prepare(`SELECT COUNT(*) count FROM cup_events WHERE status='active' AND ends_at>?`).bind(new Date().toISOString()).first<any>(); return json({version:'63.0.0',checkedAt:new Date().toISOString(),activeArenas:Number(active?.count||0),activeCups:Number(cups?.count||0),activeTournaments:Number(activeTournaments?.count||0),waitingMatchmaking:Number(waiting?.count||0),finishedGames24h:Number(games24?.count||0),arenaGames24h:Number(arenaGames24?.count||0),users:Number(users?.count||0)});
+      } catch { return json({error:'Metrikler okunamadı.'},{status:400}); }
+    }
+    if (url.pathname === '/api/cup' && request.method === 'GET') {
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try {
+        const kind=(url.searchParams.get('kind')==='weekly'?'weekly':'daily') as 'daily'|'weekly';
+        const c=await ensureCup(env.DB,kind);
+        const cup=await env.DB.prepare(`SELECT id,label,kind,starts_at,ends_at,status FROM cup_events WHERE id=?`).bind(c.id).first<any>();
+        const joined=await env.DB.prepare(`SELECT 1 FROM cup_participants WHERE cup_id=? AND user_id=? AND left_at IS NULL`).bind(c.id,user.id).first();
+        const rows=(await env.DB.prepare(`SELECT u.id,u.display_name,u.rating,
+          COALESCE(SUM(CASE WHEN ((g.white_user_id=cp.user_id AND g.result='1-0') OR (g.black_user_id=cp.user_id AND g.result='0-1')) THEN 2 WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) points,
+          COUNT(DISTINCT g.id) games,
+          COALESCE(SUM(CASE WHEN (g.white_user_id=cp.user_id AND g.result='1-0') OR (g.black_user_id=cp.user_id AND g.result='0-1') THEN 1 ELSE 0 END),0) wins,
+          COALESCE(SUM(CASE WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) draws
+          FROM cup_participants cp JOIN users u ON u.id=cp.user_id
+          LEFT JOIN cup_participants op ON op.cup_id=cp.cup_id AND op.user_id<>cp.user_id
+          LEFT JOIN games g ON g.status='finished' AND g.ended_at>=? AND g.ended_at<?
+            AND ((g.white_user_id=cp.user_id AND g.black_user_id=op.user_id) OR (g.black_user_id=cp.user_id AND g.white_user_id=op.user_id))
+            AND g.ended_at>=cp.joined_at AND (cp.left_at IS NULL OR g.ended_at<=cp.left_at)
+            AND g.ended_at>=op.joined_at AND (op.left_at IS NULL OR g.ended_at<=op.left_at)
+          WHERE cp.cup_id=? GROUP BY cp.user_id ORDER BY points DESC,wins DESC,games DESC,u.rating DESC LIMIT 50`).bind(c.start,c.end,c.id).all<any>()).results||[];
+        const rewards=(await env.DB.prepare(`SELECT user_id,rank,reward_key FROM cup_rewards WHERE cup_id=?`).bind(c.id).all<any>()).results||[];
+        const rewardByUser=new Map<string,any>();
+        for(const r of rewards) rewardByUser.set(String(r.user_id),{rank:Number(r.rank),rewardKey:String(r.reward_key)});
+        const leaderboard=rows.map((r:any,i:number)=>{
+          const games=Number(r.games||0),wins=Number(r.wins||0),draws=Number(r.draws||0);
+          return {...r,rank:i+1,points:Number(r.points||0),games,wins,draws,losses:Math.max(0,games-wins-draws),winRate:games?Math.round(wins*1000/games)/10:0,reward:rewardByUser.get(String(r.id))||null};
+        });
+        return json({cup,joined:Boolean(joined),viewer:leaderboard.find((x:any)=>x.id===user.id)||null,leaderboard});
+      } catch { return json({error:'Cup verisi yüklenemedi.'},{status:400}); }
+    }
+    if (url.pathname === '/api/cup/join' && request.method === 'POST') {
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401}); try { const b=await request.json().catch(()=>({})) as any; const kind=(b.kind==='weekly'?'weekly':'daily') as 'daily'|'weekly'; const c=await ensureCup(env.DB,kind); const now=new Date().toISOString(); await env.DB.prepare(`INSERT INTO cup_participants(cup_id,user_id,joined_at) VALUES(?,?,?) ON CONFLICT(cup_id,user_id) DO UPDATE SET joined_at=excluded.joined_at,left_at=NULL`).bind(c.id,user.id,now).run(); return json({ok:true,cup:c,joined:true}); } catch { return json({error:'Cup katılımı başarısız.'},{status:400}); }
+    }
+    if (url.pathname === '/api/cup/leave' && request.method === 'POST') {
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401}); try { const b=await request.json().catch(()=>({})) as any; const kind=(b.kind==='weekly'?'weekly':'daily') as 'daily'|'weekly'; const c=await ensureCup(env.DB,kind); await env.DB.prepare(`UPDATE cup_participants SET left_at=? WHERE cup_id=? AND user_id=? AND left_at IS NULL`).bind(new Date().toISOString(),c.id,user.id).run(); return json({ok:true,joined:false}); } catch { return json({error:'Cup çıkışı başarısız.'},{status:400}); }
+    }
+    if (url.pathname === '/api/cup/history' && request.method === 'GET') {
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try {
+        await finalizeCupRewards(env.DB);
+        const rows=(await env.DB.prepare(`SELECT id,label,kind,starts_at,ends_at,status FROM cup_events WHERE status='finished' ORDER BY ends_at DESC LIMIT 16`).all<any>()).results||[];
+        const history:any[]=[];
+        for(const c of rows){
+          const r=await env.DB.prepare(`SELECT COALESCE(SUM(CASE WHEN ((g.white_user_id=cp.user_id AND g.result='1-0') OR (g.black_user_id=cp.user_id AND g.result='0-1')) THEN 2 WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) points,COUNT(DISTINCT g.id) games,COALESCE(SUM(CASE WHEN ((g.white_user_id=cp.user_id AND g.result='1-0') OR (g.black_user_id=cp.user_id AND g.result='0-1') THEN 1 ELSE 0 END),0) wins,COALESCE(SUM(CASE WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) draws FROM cup_participants cp LEFT JOIN cup_participants op ON op.cup_id=cp.cup_id AND op.user_id<>cp.user_id LEFT JOIN games g ON g.status='finished' AND g.ended_at>=? AND g.ended_at<? AND ((g.white_user_id=cp.user_id AND g.black_user_id=op.user_id) OR (g.black_user_id=cp.user_id AND g.white_user_id=op.user_id)) AND g.ended_at>=cp.joined_at AND (cp.left_at IS NULL OR g.ended_at<=cp.left_at) AND g.ended_at>=op.joined_at AND (op.left_at IS NULL OR g.ended_at<=op.left_at) WHERE cp.cup_id=? AND cp.user_id=?`).bind(c.starts_at,c.ends_at,c.id,user.id).first<any>();
+          const reward=await env.DB.prepare(`SELECT rank,reward_key FROM cup_rewards WHERE cup_id=? AND user_id=?`).bind(c.id,user.id).first<any>();
+          const games=Number(r?.games||0),wins=Number(r?.wins||0),draws=Number(r?.draws||0);
+          history.push({...c,stats:{points:Number(r?.points||0),games,wins,draws,losses:Math.max(0,games-wins-draws),winRate:games?Math.round(wins*1000/games)/10:0},reward:reward?{rank:Number(reward.rank),rewardKey:String(reward.reward_key)}:null});
+        }
+        return json({history});
+      } catch { return json({error:'Cup geçmişi yüklenemedi.'},{status:400}); }
+    }
+    const tournamentShareStats=url.pathname.match(/^\/api\/tournaments\/([^/]+)\/share\/stats$/);
+    if(tournamentShareStats && request.method==='GET'){
+      if(!user)return json({error:'Oturum gerekli.'},{status:401});
+      try{const id=decodeURIComponent(tournamentShareStats[1]); const t=await env.DB.prepare(`SELECT id,created_by FROM tournaments WHERE id=?`).bind(id).first<any>(); if(!t)return json({error:'Turnuva bulunamadı.'},{status:404}); if(t.created_by!==user.id)return json({error:'Sadece turnuva sahibi erişebilir.'},{status:403}); const share=await env.DB.prepare(`SELECT id,created_at,revoked_at,views_count,last_viewed_at,expires_at,visibility FROM tournament_shares WHERE tournament_id=? ORDER BY created_at DESC LIMIT 1`).bind(id).first<any>(); const daily=share?(await env.DB.prepare(`SELECT day,views FROM tournament_share_daily WHERE share_id=? ORDER BY day DESC LIMIT 14`).bind(share.id).all<any>()).results||[]:[]; return json({share:share||null,daily});}catch{return json({error:'Paylaşım istatistiği alınamadı.'},{status:400});}
+    }
+    const tournamentShareHealth=url.pathname.match(/^\/api\/tournaments\/([^/]+)\/share\/health$/);
+    if(tournamentShareHealth && request.method==='GET'){
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try{const id=decodeURIComponent(tournamentShareHealth[1]); const t=await env.DB.prepare(`SELECT id,created_by FROM tournaments WHERE id=?`).bind(id).first<any>(); if(!t)return json({error:'Turnuva bulunamadı.'},{status:404}); if(t.created_by!==user.id)return json({error:'Sadece turnuva sahibi erişebilir.'},{status:403}); const share=await env.DB.prepare(`SELECT id,views_count,last_viewed_at,expires_at,visibility,revoked_at FROM tournament_shares WHERE tournament_id=? ORDER BY created_at DESC LIMIT 1`).bind(id).first<any>(); if(!share)return json({share:null,health:{status:'missing',blockedRequests:0,requestsLastHour:0}}); const tokenHashRow=await env.DB.prepare(`SELECT token_hash FROM tournament_shares WHERE id=?`).bind(share.id).first<any>(); const blocked=tokenHashRow?(await env.DB.prepare(`SELECT COALESCE(SUM(blocked_hits),0) blocked,COALESCE(SUM(allowed_hits),0) allowed FROM tournament_share_abuse_windows WHERE token_hash=? AND window_start>=?`).bind(tokenHashRow.token_hash,new Date(Date.now()-3600000).toISOString()).first<any>()):null; const expired=share.expires_at?new Date(share.expires_at).getTime()<=Date.now():false; const status=share.revoked_at?'revoked':expired?'expired':share.visibility!=='public'?'private':Number(blocked?.blocked||0)>0?'throttled':'healthy'; const audit=(await env.DB.prepare(`SELECT event,metadata,created_at FROM tournament_share_audit WHERE tournament_id=? ORDER BY created_at DESC LIMIT 10`).bind(id).all<any>()).results||[]; const auditSummary=(await env.DB.prepare(`SELECT event,SUM(count) count FROM tournament_share_audit_daily WHERE tournament_id=? AND day>=? GROUP BY event`).bind(id,new Date(Date.now()-30*86400000).toISOString().slice(0,10)).all<any>()).results||[]; const auditTrend=(await env.DB.prepare(`SELECT day,event,SUM(count) count FROM tournament_share_audit_daily WHERE tournament_id=? AND day>=? GROUP BY day,event ORDER BY day ASC`).bind(id,new Date(Date.now()-30*86400000).toISOString().slice(0,10)).all<any>()).results||[]; const expiresSoon=share.expires_at?Math.max(0,Math.ceil((new Date(share.expires_at).getTime()-Date.now())/86400000)):null; const alerts:string[]=[]; if(Number(blocked?.blocked||0)>0)alerts.push('rate-limit'); if(expiresSoon!==null&&expiresSoon<=7)alerts.push('expiration-soon'); if(share.visibility!=='public')alerts.push('private'); if(share.revoked_at)alerts.push('revoked'); const cacheTrend=(await env.DB.prepare(`SELECT day,route,SUM(origin_hits) originHits,SUM(conditional_hits) conditionalHits FROM tournament_share_cache_daily WHERE tournament_id=? AND day>=? GROUP BY day,route ORDER BY day ASC`).bind(id,new Date(Date.now()-30*86400000).toISOString().slice(0,10)).all<any>()).results||[]; const cacheSummaryRaw=(await env.DB.prepare(`SELECT route,SUM(origin_hits) originHits,SUM(conditional_hits) conditionalHits FROM tournament_share_cache_daily WHERE tournament_id=? AND day>=? GROUP BY route ORDER BY route`).bind(id,new Date(Date.now()-30*86400000).toISOString().slice(0,10)).all<any>()).results||[]; const cacheSummary=cacheSummaryRaw.map((r:any)=>{const origin=Number(r.originHits||0),conditional=Number(r.conditionalHits||0),total=origin+conditional;return {...r,hitRate:total?Math.round(conditional*10000/total)/100:0,total};}); const alertHistory=(await env.DB.prepare(`SELECT h.alert,h.first_seen_at firstSeenAt,h.last_seen_at lastSeenAt,h.occurrences,a.acknowledged_at acknowledgedAt,a.acknowledged_occurrences acknowledgedOccurrences FROM tournament_share_alert_history h LEFT JOIN tournament_share_alert_ack a ON a.share_id=h.share_id AND a.alert=h.alert WHERE h.tournament_id=? ORDER BY h.last_seen_at DESC LIMIT 20`).bind(id).all<any>()).results||[]; await recordShareAlerts(env.DB,id,share.id,alerts); return json({share:{id:share.id,views:Number(share.views_count||0),lastViewedAt:share.last_viewed_at,expiresAt:share.expires_at,visibility:share.visibility},health:{status,blockedRequestsLastHour:Number(blocked?.blocked||0),allowedRequestsLastHour:Number(blocked?.allowed||0),rateLimitPerMinute:60,expiresInDays:expiresSoon,alerts},cache:{html:'ETag · 60s',tournamentJson:'ETag · 60s',replayJson:'ETag · 300s',ogImage:'ETag · 300s',conditional304:'view count is not incremented',diagnosticHeader:'x-zato-cache',trend:cacheTrend,summary:cacheSummary},audit,auditSummary,auditTrend,alertHistory});}catch{return json({error:'Paylaşım sağlığı alınamadı.'},{status:400});}
+    }
+    const tournamentShareAlertAck=url.pathname.match(/^\/api\/tournaments\/([^/]+)\/share\/health\/ack$/);
+    if(tournamentShareAlertAck && request.method==='POST'){
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try{const id=decodeURIComponent(tournamentShareAlertAck[1]); const t=await env.DB.prepare(`SELECT id,created_by FROM tournaments WHERE id=?`).bind(id).first<any>(); if(!t)return json({error:'Turnuva bulunamadı.'},{status:404}); if(t.created_by!==user.id)return json({error:'Sadece turnuva sahibi uyarı onaylayabilir.'},{status:403}); const body=await request.json().catch(()=>({})) as any; const alert=String(body.alert||'').slice(0,64); const acknowledged=body.acknowledged!==false; if(!alert)return json({error:'Uyarı belirtilmedi.'},{status:400}); const share=await env.DB.prepare(`SELECT id FROM tournament_shares WHERE tournament_id=? ORDER BY created_at DESC LIMIT 1`).bind(id).first<any>(); if(!share)return json({error:'Paylaşım bulunamadı.'},{status:404}); const now=new Date().toISOString(); let result; if(acknowledged){result=await env.DB.prepare(`INSERT INTO tournament_share_alert_ack(share_id,alert,acknowledged_at,acknowledged_by,acknowledged_occurrences) VALUES(?,?,?,?,COALESCE((SELECT occurrences FROM tournament_share_alert_history WHERE share_id=? AND alert=?),0)) ON CONFLICT(share_id,alert) DO UPDATE SET acknowledged_at=excluded.acknowledged_at,acknowledged_by=excluded.acknowledged_by,acknowledged_occurrences=excluded.acknowledged_occurrences`).bind(share.id,alert,now,user.id,share.id,alert).run();}else{result=await env.DB.prepare(`DELETE FROM tournament_share_alert_ack WHERE share_id=? AND alert=?`).bind(share.id,alert).run();} const occurrenceRow=await env.DB.prepare(`SELECT occurrences FROM tournament_share_alert_history WHERE share_id=? AND alert=?`).bind(share.id,alert).first<any>(); await env.DB.prepare(`INSERT INTO tournament_share_alert_ack_audit(id,share_id,alert,action,occurrences,acknowledged_by,created_at) VALUES(?,?,?,?,?,?,?)`).bind(crypto.randomUUID(),share.id,alert,acknowledged?'acknowledged':'unacknowledged',Number(occurrenceRow?.occurrences||0),user.id,now).run(); return json({ok:true,updated:Number(result.meta?.changes||0),alert,acknowledged,occurrences:Number(occurrenceRow?.occurrences||0)});}catch{return json({error:'Uyarı durumu güncellenemedi.'},{status:400});}
+    }
+    const tournamentShareMatch=url.pathname.match(/^\/api\/tournaments\/([^/]+)\/share$/);
+    if(tournamentShareMatch && request.method==='POST'){
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try{const id=decodeURIComponent(tournamentShareMatch[1]); const t=await env.DB.prepare(`SELECT id,created_by FROM tournaments WHERE id=?`).bind(id).first<any>(); if(!t)return json({error:'Turnuva bulunamadı.'},{status:404}); if(t.created_by!==user.id)return json({error:'Sadece turnuva sahibi paylaşım oluşturabilir.'},{status:403}); const existing=await env.DB.prepare(`SELECT id FROM tournament_shares WHERE tournament_id=? AND revoked_at IS NULL LIMIT 1`).bind(id).first<any>(); if(existing){await env.DB.prepare(`UPDATE tournament_shares SET revoked_at=? WHERE id=?`).bind(new Date().toISOString(),existing.id).run(); await logShareAudit(env.DB,id,existing.id,'rotated',{reason:'new-token'});}
+        const token=shareToken(),hash=await sha256Hex(token),sid=crypto.randomUUID(),expiresAt=new Date(Date.now()+SHARE_DEFAULT_DAYS*86400000).toISOString(); await env.DB.prepare(`INSERT INTO tournament_shares(id,tournament_id,token_hash,created_by,expires_at,visibility) VALUES(?,?,?,?,?,?)`).bind(sid,id,hash,user.id,expiresAt,'public').run(); await logShareAudit(env.DB,id,sid,'created',{expiresInDays:SHARE_DEFAULT_DAYS,visibility:'public'}); return json({ok:true,shareId:sid,token,expiresAt,visibility:'public',publicPath:'/share/tournament/'+encodeURIComponent(token),views:0});
+      }catch{return json({error:'Paylaşım bağlantısı oluşturulamadı.'},{status:400});}
+    }
+    const tournamentShareUpdate=url.pathname.match(/^\/api\/tournaments\/([^/]+)\/share$/);
+    if(tournamentShareUpdate && request.method==='PATCH'){
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try{const id=decodeURIComponent(tournamentShareUpdate[1]); const t=await env.DB.prepare(`SELECT id,created_by FROM tournaments WHERE id=?`).bind(id).first<any>(); if(!t)return json({error:'Turnuva bulunamadı.'},{status:404}); if(t.created_by!==user.id)return json({error:'Sadece turnuva sahibi paylaşımı yönetebilir.'},{status:403}); const body=await request.json().catch(()=>({})) as any; const visibility=body.visibility==='private'?'private':'public'; const days=Math.max(1,Math.min(365,Number(body.expiresInDays||SHARE_DEFAULT_DAYS))); const expiresAt=new Date(Date.now()+days*86400000).toISOString(); const active=await env.DB.prepare(`SELECT id FROM tournament_shares WHERE tournament_id=? AND revoked_at IS NULL LIMIT 1`).bind(id).first<any>(); await env.DB.prepare(`UPDATE tournament_shares SET visibility=?,expires_at=? WHERE tournament_id=? AND revoked_at IS NULL`).bind(visibility,expiresAt,id).run(); if(active) await logShareAudit(env.DB,id,active.id,'updated',{expiresInDays:days,visibility}); return json({ok:true,visibility,expiresAt});}catch{return json({error:'Paylaşım ayarı güncellenemedi.'},{status:400});}
+    }
+const tournamentShareMaintenance=url.pathname.match(/^\/api\/tournaments\/([^/]+)\/share\/health\/maintenance$/); if(tournamentShareMaintenance && request.method==='GET'){if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401}); try{const id=decodeURIComponent(tournamentShareMaintenance[1]);const t=await env.DB.prepare(`SELECT id,created_by FROM tournaments WHERE id=?`).bind(id).first<any>();if(!t)return json({error:'Turnuva bulunamadı.'},{status:404});if(t.created_by!==user.id)return json({error:'Sadece turnuva sahibi erişebilir.'},{status:403});const runs=(await env.DB.prepare(`SELECT r.id,r.ran_at ranAt,r.audit_aggregated auditAggregated,r.audit_deleted auditDeleted,r.cache_deleted cacheDeleted,r.alerts_deleted alertsDeleted,r.rate_limits_deleted rateLimitsDeleted,r.abuse_windows_deleted abuseWindowsDeleted,COALESCE(m.status,'ok') status,COALESCE(m.error_count,0) errorCount FROM tournament_share_maintenance_runs r LEFT JOIN tournament_share_maintenance_run_meta m ON m.run_id=r.id ORDER BY r.ran_at DESC LIMIT 10`).all<any>()).results||[];const errors=(await env.DB.prepare(`SELECT run_id runId,stage,message,created_at createdAt FROM tournament_share_maintenance_errors WHERE run_id IN (SELECT id FROM tournament_share_maintenance_runs ORDER BY ran_at DESC LIMIT 10) ORDER BY created_at DESC`).all<any>()).results||[];return json({version:'v62',runs,errors});}catch{return json({error:'Bakım tanılaması alınamadı.'},{status:400});}}
+    const tournamentShareMaintenanceReplay=url.pathname.match(/^\/api\/tournaments\/([^/]+)\/share\/health\/maintenance\/replay$/); if(tournamentShareMaintenanceReplay && request.method==='POST'){if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503});const user=await authUser(request,env);if(!user)return json({error:'Giriş gerekli.'},{status:401});try{const id=decodeURIComponent(tournamentShareMaintenanceReplay[1]);const t=await env.DB.prepare(`SELECT id,created_by FROM tournaments WHERE id=?`).bind(id).first<any>();if(!t)return json({error:'Turnuva bulunamadı.'},{status:404});if(t.created_by!==user.id)return json({error:'Sadece turnuva sahibi replay çalıştırabilir.'},{status:403});const now=new Date();const cutoffs={audit:new Date(now.getTime()-90*86400000).toISOString(),cache:new Date(now.getTime()-90*86400000).toISOString().slice(0,10),alerts:new Date(now.getTime()-180*86400000).toISOString(),runs:new Date(now.getTime()-90*86400000).toISOString()};const q=async(sql:string,...args:any[])=>Number((await env.DB.prepare(sql).bind(...args).first<any>())?.n||0);const plan={auditAggregateCandidates:await q(`SELECT COUNT(*) n FROM tournament_share_audit WHERE tournament_id=? AND created_at>=?`,id,new Date(now.getTime()-91*86400000).toISOString()),auditRetentionCandidates:await q(`SELECT COUNT(*) n FROM tournament_share_audit WHERE tournament_id=? AND created_at<?`,id,cutoffs.audit),cacheRetentionCandidates:await q(`SELECT COUNT(*) n FROM tournament_share_cache_daily WHERE tournament_id=? AND day<?`,id,cutoffs.cache),alertRetentionCandidates:await q(`SELECT COUNT(*) n FROM tournament_share_alert_history WHERE tournament_id=? AND last_seen_at<?`,id,cutoffs.alerts),maintenanceRetentionCandidates:await q(`SELECT COUNT(*) n FROM tournament_share_maintenance_runs WHERE ran_at<?`,cutoffs.runs)};const previous=await env.DB.prepare(`SELECT payload FROM tournament_share_maintenance_replays WHERE tournament_id=? ORDER BY created_at DESC LIMIT 1`).bind(id).first<any>();let previousPlan:any=null;try{previousPlan=previous?.payload?JSON.parse(previous.payload).plan:null}catch{}const diff=previousPlan?Object.fromEntries(Object.keys(plan).map(k=>[k,{previous:Number(previousPlan[k]||0),current:Number(plan[k]||0),delta:Number(plan[k]||0)-Number(previousPlan[k]||0)}])):{};const replayId=crypto.randomUUID();const payload={version:'v64',mode:'dry-run',generatedAt:now.toISOString(),cutoffs,plan,diff};await env.DB.prepare(`INSERT INTO tournament_share_maintenance_replays(id,tournament_id,created_at,status,payload) VALUES(?,?,?,?,?)`).bind(replayId,id,now.toISOString(),'dry-run',JSON.stringify(payload)).run();return json({ok:true,replayId,...payload});}catch{return json({error:'Bakım replay simülasyonu alınamadı.'},{status:400});}}
+const tournamentShareAlertAudit=url.pathname.match(/^\/api\/tournaments\/([^/]+)\/share\/health\/alerts\/audit$/); if(tournamentShareAlertAudit && request.method==='GET'){if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503});const user=await authUser(request,env);if(!user)return json({error:'Giriş gerekli.'},{status:401});try{const id=decodeURIComponent(tournamentShareAlertAudit[1]);const t=await env.DB.prepare(`SELECT id,created_by FROM tournaments WHERE id=?`).bind(id).first<any>();if(!t)return json({error:'Turnuva bulunamadı.'},{status:404});if(t.created_by!==user.id)return json({error:'Sadece turnuva sahibi erişebilir.'},{status:403});const u=new URL(request.url);const alert=u.searchParams.get('alert')||'';const action=u.searchParams.get('action')||'';const before=u.searchParams.get('before')||'';const limit=Math.max(1,Math.min(100,Number(u.searchParams.get('limit')||50)));let sql=`SELECT aa.alert,aa.action,aa.occurrences,aa.created_at createdAt FROM tournament_share_alert_ack_audit aa JOIN tournament_share_alert_history h ON h.share_id=aa.share_id AND h.alert=aa.alert WHERE h.tournament_id=?`;const args:any[]=[id];if(alert){sql+=' AND aa.alert=?';args.push(alert.slice(0,64));}if(action){sql+=' AND aa.action=?';args.push(action.slice(0,32));}if(before){sql+=' AND aa.created_at<?';args.push(before.slice(0,64));}sql+=` ORDER BY aa.created_at DESC LIMIT ${limit+1}`;const rows=(await env.DB.prepare(sql).bind(...args).all<any>()).results||[];const hasMore=rows.length>limit;const pageRows=hasMore?rows.slice(0,limit):rows;return json({version:'v64',filters:{alert:alert||null,action:action||null,limit,before:before||null},rows:pageRows,nextBefore:hasMore?pageRows[pageRows.length-1]?.createdAt:null,hasMore});}catch{return json({error:'Alert audit alınamadı.'},{status:400});}}
+const tournamentShareKeyLifecycle=url.pathname.match(/^\/api\/tournaments\/([^/]+)\/share\/health\/keys$/);
+    if(tournamentShareKeyLifecycle && request.method==='GET'){
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try{const id=decodeURIComponent(tournamentShareKeyLifecycle[1]);const t=await env.DB.prepare(`SELECT id,created_by FROM tournaments WHERE id=?`).bind(id).first<any>();if(!t)return json({error:'Turnuva bulunamadı.'},{status:404});if(t.created_by!==user.id)return json({error:'Sadece turnuva sahibi erişebilir.'},{status:403});const configuredId=env.SHARE_EXPORT_SIGNING_KEY_ID||'unconfigured';if(env.SHARE_EXPORT_SIGNING_SECRET&&configuredId!=='unconfigured')await env.DB.prepare(`INSERT INTO tournament_share_export_keys(key_id,algorithm,status,created_at) VALUES(?,?,?,?) ON CONFLICT(key_id) DO UPDATE SET status='active'`).bind(configuredId,'HMAC-SHA256','active',new Date().toISOString()).run();const keys=(await env.DB.prepare(`SELECT key_id keyId,algorithm,status,created_at createdAt,retired_at retiredAt FROM tournament_share_export_keys ORDER BY created_at DESC`).all<any>()).results||[];return json({version:'v64',configured:{keyId:configuredId,algorithm:'HMAC-SHA256',signatureConfigured:Boolean(env.SHARE_EXPORT_SIGNING_SECRET)},keys});}catch{return json({error:'İmza anahtar durumu alınamadı.'},{status:400});}
+    }
+    if(tournamentShareKeyLifecycle && request.method==='POST'){
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try{const id=decodeURIComponent(tournamentShareKeyLifecycle[1]);const t=await env.DB.prepare(`SELECT id,created_by FROM tournaments WHERE id=?`).bind(id).first<any>();if(!t)return json({error:'Turnuva bulunamadı.'},{status:404});if(t.created_by!==user.id)return json({error:'Sadece turnuva sahibi erişebilir.'},{status:403});const body=await request.json().catch(()=>({})) as any;const keyId=String(body.keyId||'').slice(0,128);const action=body.action==='retire'?'retire':'activate';const configuredId=env.SHARE_EXPORT_SIGNING_KEY_ID||'unconfigured';if(!keyId)return json({error:'keyId gerekli.'},{status:400});if(action==='retire'&&keyId===configuredId)return json({error:'Aktif deploy anahtarı önce yeni key ile değiştirilmelidir.'},{status:409});if(action==='activate'&&(keyId!==configuredId||!env.SHARE_EXPORT_SIGNING_SECRET))return json({error:'Yalnızca yapılandırılmış signing key etkinleştirilebilir.'},{status:409});if(action==='retire'){await env.DB.prepare(`UPDATE tournament_share_export_keys SET status='retired',retired_at=? WHERE key_id=?`).bind(new Date().toISOString(),keyId).run();}else{await env.DB.prepare(`UPDATE tournament_share_export_keys SET status='active',retired_at=NULL WHERE key_id=?`).bind(keyId).run();}await env.DB.prepare(`INSERT INTO tournament_share_export_key_events(id,key_id,action,created_at) VALUES(?,?,?,?)`).bind(crypto.randomUUID(),keyId,action,new Date().toISOString()).run();return json({ok:true,version:'v64',keyId,action});}catch{return json({error:'İmza anahtarı yaşam döngüsü güncellenemedi.'},{status:400});}
+    }
+    const tournamentShareVerify=url.pathname.match(/^\/api\/tournaments\/([^/]+)\/share\/health\/export\/verify$/);
+    if(tournamentShareVerify && request.method==='POST'){
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try{const id=decodeURIComponent(tournamentShareVerify[1]);const t=await env.DB.prepare(`SELECT id,created_by FROM tournaments WHERE id=?`).bind(id).first<any>();if(!t)return json({error:'Turnuva bulunamadı.'},{status:404});if(t.created_by!==user.id)return json({error:'Sadece turnuva sahibi doğrulama yapabilir.'},{status:403});const body=await request.json().catch(()=>({})) as any;const exportBody={...body};const integrity=exportBody.integrity||{};delete exportBody.integrity;const calculated=await shareExportIntegrity(exportBody);const hashVerified=Boolean(integrity.sha256)&&integrity.sha256===calculated;const configuredId=env.SHARE_EXPORT_SIGNING_KEY_ID||'unconfigured';const keyRow=await env.DB.prepare(`SELECT status FROM tournament_share_export_keys WHERE key_id=?`).bind(String(integrity.keyId||'unconfigured')).first<any>();const signatureVerified=Boolean(env.SHARE_EXPORT_SIGNING_SECRET&&integrity.signature&&integrity.keyId===configuredId&&(keyRow?.status||'active')==='active')&&await hmacSha256Verify(env.SHARE_EXPORT_SIGNING_SECRET,calculated,integrity.signature);await env.DB.prepare(`INSERT INTO tournament_share_export_keys(key_id,algorithm,status,created_at) VALUES(?,?,?,?) ON CONFLICT(key_id) DO NOTHING`).bind(String(integrity.keyId||'unconfigured'),'HMAC-SHA256',signatureVerified?'active':'retired',new Date().toISOString()).run();return json({version:'v64',hashVerified,signatureVerified,signatureConfigured:Boolean(env.SHARE_EXPORT_SIGNING_SECRET),keyId:integrity.keyId||'unconfigured',algorithm:'HMAC-SHA256'});}catch{return json({error:'Export doğrulanamadı.'},{status:400});}
+    }
+    const tournamentShareHealthExportMatch=url.pathname.match(/^\/api\/tournaments\/([^/]+)\/share\/health\/export$/);
+    if(tournamentShareHealthExportMatch && request.method==='GET'){
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try{const id=decodeURIComponent(tournamentShareHealthExportMatch[1]);const t=await env.DB.prepare(`SELECT id,created_by,name FROM tournaments WHERE id=?`).bind(id).first<any>();if(!t)return json({error:'Turnuva bulunamadı.'},{status:404});if(t.created_by!==user.id)return json({error:'Sadece turnuva sahibi erişebilir.'},{status:403});const share=await env.DB.prepare(`SELECT id,views_count,last_viewed_at,expires_at,visibility,revoked_at FROM tournament_shares WHERE tournament_id=? ORDER BY created_at DESC LIMIT 1`).bind(id).first<any>();const trend=(await env.DB.prepare(`SELECT day,event,SUM(count) count FROM tournament_share_audit_daily WHERE tournament_id=? AND day>=? GROUP BY day,event ORDER BY day,event`).bind(id,new Date(Date.now()-30*86400000).toISOString().slice(0,10)).all<any>()).results||[];const cache=(await env.DB.prepare(`SELECT day,route,origin_hits originHits,conditional_hits conditionalHits FROM tournament_share_cache_daily WHERE tournament_id=? AND day>=? ORDER BY day,route`).bind(id,new Date(Date.now()-30*86400000).toISOString().slice(0,10)).all<any>()).results||[];const alerts=(await env.DB.prepare(`SELECT h.alert,h.first_seen_at firstSeenAt,h.last_seen_at lastSeenAt,h.occurrences,a.acknowledged_at acknowledgedAt,a.acknowledged_occurrences acknowledgedOccurrences FROM tournament_share_alert_history h LEFT JOIN tournament_share_alert_ack a ON a.share_id=h.share_id AND a.alert=h.alert WHERE h.tournament_id=? ORDER BY h.last_seen_at DESC`).bind(id).all<any>()).results||[];const alertAudit=(await env.DB.prepare(`SELECT aa.alert,aa.action,aa.occurrences,aa.created_at createdAt FROM tournament_share_alert_ack_audit aa JOIN tournament_share_alert_history h ON h.share_id=aa.share_id AND h.alert=aa.alert WHERE h.tournament_id=? ORDER BY aa.created_at DESC LIMIT 50`).bind(id).all<any>()).results||[];const maintenanceRuns=(await env.DB.prepare(`SELECT r.ran_at ranAt,COALESCE(m.status,'ok') status,COALESCE(m.error_count,0) errorCount FROM tournament_share_maintenance_runs r LEFT JOIN tournament_share_maintenance_run_meta m ON m.run_id=r.id ORDER BY r.ran_at DESC LIMIT 10`).all<any>()).results||[];const cacheSummaryRaw=(await env.DB.prepare(`SELECT route,SUM(origin_hits) originHits,SUM(conditional_hits) conditionalHits FROM tournament_share_cache_daily WHERE tournament_id=? AND day>=? GROUP BY route ORDER BY route`).bind(id,new Date(Date.now()-30*86400000).toISOString().slice(0,10)).all<any>()).results||[];const cacheSummary=cacheSummaryRaw.map((r:any)=>{const origin=Number(r.originHits||0),conditional=Number(r.conditionalHits||0),total=origin+conditional;return {...r,hitRate:total?Math.round(conditional*10000/total)/100:0,total};});const exportBody={schemaVersion:'1.2',exportVersion:'v64',exportedAt:new Date().toISOString(),tournament:{id:t.id,name:t.name},share:share?{id:share.id,views:Number(share.views_count||0),lastViewedAt:share.last_viewed_at,expiresAt:share.expires_at,visibility:share.visibility,revoked:Boolean(share.revoked_at)}:null,auditTrend:trend,cacheTrend:cache,cacheSummary,alertHistory:alerts,alertAudit,maintenanceRuns}; const integrity=await shareExportIntegrity(exportBody); const keyId=env.SHARE_EXPORT_SIGNING_KEY_ID||'unconfigured'; const signature=env.SHARE_EXPORT_SIGNING_SECRET?await hmacSha256Hex(env.SHARE_EXPORT_SIGNING_SECRET,integrity):null; return json({...exportBody,integrity:{version:2,algorithm:'SHA-256',sha256:integrity,signatureAlgorithm:'HMAC-SHA256',keyId,signature,signatureConfigured:Boolean(signature)}},{headers:{'cache-control':'private, no-store'}});}catch{return json({error:'Paylaşım sağlık exportu alınamadı.'},{status:400});}
+    }
+    const tournamentShareRevoke=url.pathname.match(/^\/api\/tournaments\/([^/]+)\/share$/);
+    if(tournamentShareRevoke && request.method==='DELETE'){
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try{const id=decodeURIComponent(tournamentShareRevoke[1]); const t=await env.DB.prepare(`SELECT id,created_by FROM tournaments WHERE id=?`).bind(id).first<any>(); if(!t)return json({error:'Turnuva bulunamadı.'},{status:404}); if(t.created_by!==user.id)return json({error:'Sadece turnuva sahibi paylaşımı iptal edebilir.'},{status:403}); const active=await env.DB.prepare(`SELECT id FROM tournament_shares WHERE tournament_id=? AND revoked_at IS NULL LIMIT 1`).bind(id).first<any>(); await env.DB.prepare(`UPDATE tournament_shares SET revoked_at=? WHERE tournament_id=? AND revoked_at IS NULL`).bind(new Date().toISOString(),id).run(); if(active) await logShareAudit(env.DB,id,active.id,'revoked',{}); return json({ok:true});}catch{return json({error:'Paylaşım iptal edilemedi.'},{status:400});}
+    }
+    if (url.pathname === '/api/tournaments/history' && request.method === 'GET') {
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try { const limit=Math.min(24,Math.max(1,Number(url.searchParams.get('limit')||12))); const rows=(await env.DB.prepare(`SELECT t.id,t.name,t.time_control,t.max_players,t.tiebreak_mode,t.created_at,t.starts_at,t.ends_at,u.display_name creator_name FROM tournaments t JOIN users u ON u.id=t.created_by WHERE t.status='finished' ORDER BY t.ends_at DESC LIMIT ?`).bind(limit).all<any>()).results||[]; const history:any[]=[]; for(const t of rows){ const reward=await env.DB.prepare(`SELECT rank,reward_key FROM tournament_rewards WHERE tournament_id=? AND user_id=?`).bind(t.id,user.id).first<any>(); const matchCount=await env.DB.prepare(`SELECT COUNT(*) count FROM tournament_matches WHERE tournament_id=?`).bind(t.id).first<any>(); const won=await env.DB.prepare(`SELECT COUNT(*) count FROM tournament_matches WHERE tournament_id=? AND winner_id=?`).bind(t.id,user.id).first<any>(); const playerMatches=(await env.DB.prepare(`SELECT COUNT(*) matches,COALESCE(SUM(CASE WHEN winner_id=? THEN 1 ELSE 0 END),0) wins,COALESCE(SUM(CASE WHEN winner_id IS NOT NULL AND winner_id<>? AND (player1_id=? OR player2_id=?) THEN 1 ELSE 0 END),0) losses,COALESCE(SUM(CASE WHEN tie_break IS NOT NULL AND tie_break<>'none' THEN 1 ELSE 0 END),0) tie_breaks FROM tournament_matches WHERE tournament_id=? AND (player1_id=? OR player2_id=?)`).bind(user.id,user.id,user.id,user.id,t.id,user.id,user.id).first<any>(); history.push({...t,matches:Number(matchCount?.count||0),wins:Number(won?.count||0),losses:Number(playerMatches?.losses||0),tieBreaks:Number(playerMatches?.tie_breaks||0),participants:Number((await env.DB.prepare(`SELECT COUNT(*) count FROM tournament_players WHERE tournament_id=?`).bind(t.id).first<any>())?.count||0),reward:reward?{rank:Number(reward.rank),rewardKey:reward.reward_key}:null}); } return json({history}); } catch { return json({error:'Turnuva geçmişi yüklenemedi.'},{status:400}); }
+    }
+    if (url.pathname === '/api/tournaments' && request.method === 'GET') {
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try { const rows=(await env.DB.prepare(`SELECT t.id,t.name,t.time_control,t.max_players,t.status,t.tiebreak_mode,t.created_at,t.starts_at,t.ends_at,COUNT(tp.user_id) participants FROM tournaments t LEFT JOIN tournament_players tp ON tp.tournament_id=t.id WHERE t.status IN ('registration','active') GROUP BY t.id ORDER BY t.created_at DESC LIMIT 12`).all<any>()).results||[]; return json({tournaments:rows}); } catch { return json({error:'Turnuvalar yüklenemedi.'},{status:400}); }
+    }
+    const tournamentMatch=url.pathname.match(/^\/api\/tournaments\/([^/]+)$/);
+    if(tournamentMatch && request.method==='GET') {
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try {
+        const id=decodeURIComponent(tournamentMatch[1]);
+        const t=await env.DB.prepare(`SELECT t.*,u.display_name creator_name FROM tournaments t JOIN users u ON u.id=t.created_by WHERE t.id=?`).bind(id).first<any>();
+        if(!t)return json({error:'Turnuva bulunamadı.'},{status:404});
+        const players=(await env.DB.prepare(`SELECT tp.user_id,tp.seed,tp.joined_at,tp.rating_at_entry,u.display_name,u.rating FROM tournament_players tp JOIN users u ON u.id=tp.user_id WHERE tp.tournament_id=? ORDER BY tp.seed,tp.joined_at`).bind(id).all<any>()).results||[];
+        const matches=(await env.DB.prepare(`SELECT m.*,u1.display_name player1_name,u2.display_name player2_name,uw.display_name winner_name,p1.rating_at_entry player1_entry_rating,p2.rating_at_entry player2_entry_rating FROM tournament_matches m LEFT JOIN users u1 ON u1.id=m.player1_id LEFT JOIN users u2 ON u2.id=m.player2_id LEFT JOIN users uw ON uw.id=m.winner_id LEFT JOIN tournament_players p1 ON p1.tournament_id=m.tournament_id AND p1.user_id=m.player1_id LEFT JOIN tournament_players p2 ON p2.tournament_id=m.tournament_id AND p2.user_id=m.player2_id WHERE m.tournament_id=? ORDER BY m.round,m.match_no`).bind(id).all<any>()).results||[];
+        const rewards=(await env.DB.prepare(`SELECT tr.*,u.display_name FROM tournament_rewards tr JOIN users u ON u.id=tr.user_id WHERE tr.tournament_id=? ORDER BY tr.rank`).bind(id).all<any>()).results||[];
+        const standings=players.map((p:any)=>{const pm=matches.filter((m:any)=>m.player1_id===p.user_id||m.player2_id===p.user_id);const wins=pm.filter((m:any)=>m.status==='finished'&&m.winner_id===p.user_id).length;const played=pm.filter((m:any)=>m.status==='finished').length;const losses=pm.filter((m:any)=>m.status==='finished'&&m.winner_id&&m.winner_id!==p.user_id).length;const opponents=pm.filter((m:any)=>m.player1_id&&m.player2_id&&m.player1_id!==m.player2_id).map((m:any)=>m.player1_id===p.user_id?Number(m.player2_entry_rating||0):Number(m.player1_entry_rating||0)).filter((n:number)=>n>0);const avgOpponentRating=opponents.length?Math.round(opponents.reduce((a:number,b:number)=>a+b,0)/opponents.length):null;const tieBreaks=pm.filter((m:any)=>m.tie_break&&m.tie_break!=='none');const tieBreakWins=tieBreaks.filter((m:any)=>m.winner_id===p.user_id).length;return {...p,played,wins,losses,points:wins*3,avgOpponentRating,tieBreaks:tieBreaks.length,tieBreakWins,eliminated:Boolean(losses&&played>0&&t.status==='active')};}).sort((a:any,b:any)=>b.points-a.points||b.wins-a.wins||(b.avgOpponentRating||0)-(a.avgOpponentRating||0)||a.seed-b.seed).map((p:any,i:number)=>({...p,rank:i+1}));
+        const rounds=Array.from(new Set(matches.map((m:any)=>Number(m.round)))).sort((a:number,b:number)=>a-b).map((round:number)=>{const rm=matches.filter((m:any)=>Number(m.round)===round);const finished=rm.filter((m:any)=>m.status==='finished').length;const tieBreaks=rm.filter((m:any)=>m.tie_break&&m.tie_break!=='none').length;const active=rm.filter((m:any)=>m.status!=='finished'&&m.player1_id&&m.player2_id).length;return {round,matches:rm.length,finished,tieBreaks,active};});
+        const tieBreakHistory=matches.filter((m:any)=>m.tie_break&&m.tie_break!=='none').map((m:any)=>({matchId:m.id,round:Number(m.round),matchNo:Number(m.match_no),mode:m.tie_break,reason:m.winner_reason,winnerId:m.winner_id,winnerName:m.winner_name,gameId:m.game_id,tiebreakGameId:m.tiebreak_game_id,tiebreakRoomCode:m.tiebreak_room_code,player1Id:m.player1_id,player2Id:m.player2_id,player1Name:m.player1_name,player2Name:m.player2_name}));
+        const completed=matches.filter((m:any)=>m.status==='finished');
+        const oppRatings=completed.flatMap((m:any)=>[Number(m.player1_entry_rating||0),Number(m.player2_entry_rating||0)]).filter((n:number)=>n>0);
+        const analytics={rounds,completedMatches:completed.length,totalMatches:matches.length,tieBreaks:tieBreakHistory.length,averageEntryRating:players.length?Math.round(players.reduce((a:number,p:any)=>a+Number(p.rating_at_entry||p.rating||0),0)/players.length):null,averageOpponentRating:oppRatings.length?Math.round(oppRatings.reduce((a:number,b:number)=>a+b,0)/oppRatings.length):null};
+        const comparisons=players.filter((p:any)=>p.user_id!==user.id).map((p:any)=>{const versus=matches.filter((m:any)=>(m.player1_id===user.id&&m.player2_id===p.user_id)||(m.player2_id===user.id&&m.player1_id===p.user_id));const wins=versus.filter((m:any)=>m.winner_id===user.id).length;const losses=versus.filter((m:any)=>m.winner_id===p.user_id).length;const draws=versus.filter((m:any)=>m.status==='finished'&&!m.winner_id).length;const tieBreaks=versus.filter((m:any)=>m.tie_break&&m.tie_break!=='none').length;return {userId:p.user_id,displayName:p.display_name,seed:p.seed,entryRating:p.rating_at_entry,wins,losses,draws,tieBreaks,matches:versus.length};}).filter((x:any)=>x.matches>0);
+        const share={title:`${t.name} · ZATO Chess`,status:t.status,players:players.length,maxPlayers:t.max_players,champion:(rewards.find((r:any)=>Number(r.rank)===1)?.display_name)||null,runnerUp:(rewards.find((r:any)=>Number(r.rank)===2)?.display_name)||null,completedMatches:completed.length,tieBreaks:tieBreakHistory.length};
+        return json({tournament:t,players,matches,rewards,standings,rounds,analytics,tieBreakHistory,comparisons,share,viewerJoined:players.some((p:any)=>p.user_id===user.id),viewerIsCreator:t.created_by===user.id});
+      } catch { return json({error:'Turnuva detayı yüklenemedi.'},{status:400}); }
+    }
+    if (url.pathname === '/api/tournaments/create' && request.method === 'POST') {
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try { const b=await request.json() as any; const name=String(b.name||'ZATO Turnuvası').trim().slice(0,60)||'ZATO Turnuvası'; const timeControl=String(b.timeControl||'5+0'); const maxPlayers=Number(b.maxPlayers||8); const tiebreakMode=String(b.tiebreakMode||'seed'); if(!TIME_CONTROLS[timeControl]||![4,8].includes(maxPlayers)||!['seed','replay'].includes(tiebreakMode))return json({error:'Turnuva 4 veya 8 oyuncu, desteklenen süre ve geçerli tie-break modu ile oluşturulabilir.'},{status:400}); const id=crypto.randomUUID(); await env.DB.prepare(`INSERT INTO tournaments(id,name,time_control,max_players,tiebreak_mode,status,created_by) VALUES(?,?,?,?,?, 'registration',?)`).bind(id,name,timeControl,maxPlayers,tiebreakMode,user.id).run(); await env.DB.prepare(`INSERT INTO tournament_players(tournament_id,user_id,seed,rating_at_entry) VALUES(?,?,1,?)`).bind(id,user.id,Number(user.rating||1200)).run(); return json({ok:true,tournamentId:id}); } catch { return json({error:'Turnuva oluşturulamadı.'},{status:400}); }
+    }
+    if (url.pathname === '/api/tournaments/join' && request.method === 'POST') {
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try { const b=await request.json() as any; const id=String(b.tournamentId||''); const t=await env.DB.prepare(`SELECT * FROM tournaments WHERE id=?`).bind(id).first<any>(); if(!t||t.status!=='registration')return json({error:'Turnuva kayıt aşamasında değil.'},{status:400}); const count=await env.DB.prepare(`SELECT COUNT(*) count FROM tournament_players WHERE tournament_id=?`).bind(id).first<any>(); if(Number(count?.count||0)>=Number(t.max_players))return json({error:'Turnuva dolu.'},{status:409}); const exists=await env.DB.prepare(`SELECT 1 FROM tournament_players WHERE tournament_id=? AND user_id=?`).bind(id,user.id).first(); if(!exists)await env.DB.prepare(`INSERT INTO tournament_players(tournament_id,user_id,seed,rating_at_entry) VALUES(?,?,?,?)`).bind(id,user.id,Number(count?.count||0)+1,Number(user.rating||1200)).run(); return json({ok:true}); } catch { return json({error:'Turnuvaya katılınamadı.'},{status:400}); }
+    }
+    if (url.pathname === '/api/tournaments/start' && request.method === 'POST') {
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try { const b=await request.json() as any; const id=String(b.tournamentId||''); const t=await env.DB.prepare(`SELECT * FROM tournaments WHERE id=? AND created_by=? AND status='registration'`).bind(id,user.id).first<any>(); if(!t)return json({error:'Turnuva bulunamadı veya başlatılamaz.'},{status:404}); const players=(await env.DB.prepare(`SELECT user_id,seed FROM tournament_players WHERE tournament_id=? ORDER BY seed`).bind(id).all<any>()).results||[]; if(players.length!==Number(t.max_players))return json({error:`Turnuvayı başlatmak için ${t.max_players} oyuncu gerekli.`},{status:400}); const rounds=Math.log2(Number(t.max_players)); const stmts:any[]=[]; for(let i=0;i<players.length;i+=2){stmts.push(env.DB.prepare(`INSERT INTO tournament_matches(id,tournament_id,round,match_no,player1_id,player2_id,room_code,status) VALUES(?,?,?,?,?,?,?,'ready')`).bind(crypto.randomUUID(),id,1,i/2+1,players[i].user_id,players[i+1].user_id,tournamentRoomCode()));} for(let round=2;round<=rounds;round++){const matches=Number(t.max_players)/(2**round);for(let n=1;n<=matches;n++)stmts.push(env.DB.prepare(`INSERT INTO tournament_matches(id,tournament_id,round,match_no,room_code,status) VALUES(?,?,?,?,?,'ready')`).bind(crypto.randomUUID(),id,round,n,tournamentRoomCode()));} stmts.push(env.DB.prepare(`UPDATE tournaments SET status='active',starts_at=? WHERE id=?`).bind(new Date().toISOString(),id)); await env.DB.batch(stmts); return json({ok:true,tournamentId:id}); } catch { return json({error:'Turnuva başlatılamadı.'},{status:400}); }
+    }
+    if (url.pathname === '/api/arena' && request.method === 'GET') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try {
+        const timeControl=String(url.searchParams.get('timeControl')||'10+0'); if(!TIME_CONTROLS[timeControl])return json({error:'Desteklenmeyen süre kontrolü.'},{status:400});
+        await finalizeArenaRewards(env.DB);
+        const a=await ensureArena(env.DB,timeControl); const arena=await env.DB.prepare(`SELECT id,label,time_control,starts_at,ends_at,status FROM arena_events WHERE id=?`).bind(a.id).first<any>();
+        const joined=await env.DB.prepare(`SELECT 1 FROM arena_participants WHERE arena_id=? AND user_id=? AND left_at IS NULL`).bind(a.id,user.id).first();
+        const rows=(await env.DB.prepare(`
+          SELECT u.id,u.username,u.display_name,u.rating,
+            COALESCE(SUM(CASE WHEN ((g.white_user_id=ap.user_id AND g.result='1-0') OR (g.black_user_id=ap.user_id AND g.result='0-1')) THEN 2 WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) points,
+            COUNT(g.id) games,
+            COALESCE(SUM(CASE WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) draws,
+            COALESCE(SUM(CASE WHEN (g.white_user_id=ap.user_id AND g.result='1-0') OR (g.black_user_id=ap.user_id AND g.result='0-1') THEN 1 ELSE 0 END),0) wins
+          FROM arena_participants ap JOIN users u ON u.id=ap.user_id
+          LEFT JOIN arena_participants op ON op.arena_id=ap.arena_id AND op.user_id<>ap.user_id
+          LEFT JOIN games g ON g.status='finished' AND g.ended_at>=? AND g.ended_at<?
+            AND ((g.white_user_id=ap.user_id AND g.black_user_id=op.user_id) OR (g.black_user_id=ap.user_id AND g.white_user_id=op.user_id))
+            AND g.ended_at>=ap.joined_at AND (ap.left_at IS NULL OR g.ended_at<=ap.left_at)
+            AND g.ended_at>=op.joined_at AND (op.left_at IS NULL OR g.ended_at<=op.left_at)
+          WHERE ap.arena_id=? GROUP BY ap.user_id ORDER BY points DESC,wins DESC,games DESC,u.rating DESC LIMIT 50
+        `).bind(a.start,a.end,a.id).all<any>()).results||[];
+        const rewards=(await env.DB.prepare(`SELECT user_id,rank,reward_key FROM arena_rewards WHERE arena_id=?`).bind(a.id).all<any>()).results||[];
+        const rewardByUser=new Map(rewards.map((r:any)=>[r.user_id,{rank:Number(r.rank),rewardKey:r.reward_key}]));
+        const leaderboard=rows.map((r:any,i:number)=>{const games=Number(r.games||0),wins=Number(r.wins||0),draws=Number(r.draws||0);return {...r,rank:i+1,points:Number(r.points||0),games,wins,draws,losses:Math.max(0,games-wins-draws),winRate:games?Math.round(wins*1000/games)/10:0,reward:rewardByUser.get(r.id)||null};});
+        const viewer=leaderboard.find((x:any)=>x.id===user.id);
+        let arenaStreak={current:0,currentType:null as string|null,bestWin:0,bestLoss:0};
+        if(viewer){
+          const gs=(await env.DB.prepare(`SELECT g.result,g.white_user_id,g.black_user_id,g.ended_at FROM games g JOIN arena_participants ap ON ap.arena_id=? AND ap.user_id=? JOIN arena_participants op ON op.arena_id=ap.arena_id AND op.user_id<>ap.user_id AND ((g.white_user_id=ap.user_id AND g.black_user_id=op.user_id) OR (g.black_user_id=ap.user_id AND g.white_user_id=op.user_id)) WHERE g.status='finished' AND g.ended_at>=? AND g.ended_at<? AND g.ended_at>=ap.joined_at AND (ap.left_at IS NULL OR g.ended_at<=ap.left_at) AND g.ended_at>=op.joined_at AND (op.left_at IS NULL OR g.ended_at<=op.left_at) ORDER BY g.ended_at DESC`).bind(a.id,user.id,a.start,a.end).all<any>()).results||[];
+          let type='';let run=0; for(const g of gs){const won=(g.white_user_id===user.id&&g.result==='1-0')||(g.black_user_id===user.id&&g.result==='0-1');const t=g.result==='1/2-1/2'?'D':won?'W':'L';if(!type){type=t;run=1;}else if(type===t)run++;else{if(type==='W')arenaStreak.bestWin=Math.max(arenaStreak.bestWin,run);if(type==='L')arenaStreak.bestLoss=Math.max(arenaStreak.bestLoss,run);type=t;run=1;}} if(type==='W')arenaStreak.bestWin=Math.max(arenaStreak.bestWin,run);if(type==='L')arenaStreak.bestLoss=Math.max(arenaStreak.bestLoss,run);arenaStreak={current:run,currentType:type||null,bestWin:arenaStreak.bestWin,bestLoss:arenaStreak.bestLoss};
+        }
+        return json({arena,joined:Boolean(joined),viewer:viewer?{...viewer,streak:arenaStreak}:null,leaderboard,rewards});
+      } catch(e) { return json({error:'Arena verisi yüklenemedi.'},{status:400}); }
+    }
+    if (url.pathname === '/api/arena/history' && request.method === 'GET') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try {
+        await finalizeArenaRewards(env.DB); const limit=Math.min(24,Math.max(1,Number(url.searchParams.get('limit')||12)));
+        const arenas=(await env.DB.prepare(`SELECT id,label,time_control,starts_at,ends_at,status FROM arena_events WHERE status='finished' ORDER BY ends_at DESC LIMIT ?`).bind(limit).all<any>()).results||[];
+        const history=[] as any[];
+        for(const a of arenas){
+          const r=await env.DB.prepare(`SELECT COALESCE(SUM(CASE WHEN ((g.white_user_id=ap.user_id AND g.result='1-0') OR (g.black_user_id=ap.user_id AND g.result='0-1')) THEN 2 WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) points,COUNT(DISTINCT g.id) games,COALESCE(SUM(CASE WHEN (g.white_user_id=ap.user_id AND g.result='1-0') OR (g.black_user_id=ap.user_id AND g.result='0-1') THEN 1 ELSE 0 END),0) wins,COALESCE(SUM(CASE WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) draws FROM arena_participants ap LEFT JOIN arena_participants op ON op.arena_id=ap.arena_id AND op.user_id<>ap.user_id LEFT JOIN games g ON g.status='finished' AND g.ended_at>=? AND g.ended_at<? AND ((g.white_user_id=ap.user_id AND g.black_user_id=op.user_id) OR (g.black_user_id=ap.user_id AND g.white_user_id=op.user_id)) AND g.ended_at>=ap.joined_at AND (ap.left_at IS NULL OR g.ended_at<=ap.left_at) AND g.ended_at>=op.joined_at AND (op.left_at IS NULL OR g.ended_at<=op.left_at) WHERE ap.arena_id=? AND ap.user_id=?`).bind(a.starts_at,a.ends_at,a.id,user.id).first<any>();
+          const reward=await env.DB.prepare(`SELECT rank,reward_key,points,games,wins,draws FROM arena_rewards WHERE arena_id=? AND user_id=?`).bind(a.id,user.id).first<any>();
+          const games=Number(r?.games||0),wins=Number(r?.wins||0),draws=Number(r?.draws||0); history.push({...a,stats:{points:Number(r?.points||0),games,wins,draws,losses:Math.max(0,games-wins-draws),winRate:games?Math.round(wins*1000/games)/10:0},reward:reward?{rank:Number(reward.rank),rewardKey:reward.reward_key,points:Number(reward.points),games:Number(reward.games),wins:Number(reward.wins),draws:Number(reward.draws)}:null});
+        }
+        return json({history});
+      } catch { return json({error:'Arena geçmişi yüklenemedi.'},{status:400}); }
+    }
+    if (url.pathname === '/api/arena/join' && request.method === 'POST') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try { const b=await request.json() as any; const timeControl=String(b.timeControl||'10+0'); if(!TIME_CONTROLS[timeControl])return json({error:'Desteklenmeyen süre kontrolü.'},{status:400}); const a=await ensureArena(env.DB,timeControl); const allowed=await arenaJoinAllowed(env.DB,user.id,a.id); if(!allowed.ok)return json({error:allowed.error},{status:429}); const now=new Date().toISOString(); await env.DB.batch([env.DB.prepare(`INSERT INTO arena_participants(arena_id,user_id,joined_at) VALUES(?,?,?) ON CONFLICT(arena_id,user_id) DO UPDATE SET joined_at=excluded.joined_at,left_at=NULL`).bind(a.id,user.id,now),env.DB.prepare(`INSERT INTO arena_join_log(id,arena_id,user_id,action,created_at) VALUES(?,?,?,?,?)`).bind(crypto.randomUUID(),a.id,user.id,'join',now)]); return json({ok:true,arena:a,joined:true}); }
+      catch { return json({error:'Arena katılımı başarısız.'},{status:400}); }
+    }
+    if (url.pathname === '/api/arena/leave' && request.method === 'POST') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try { const b=await request.json().catch(()=>({})) as any; const timeControl=String(b.timeControl||'10+0'); const a=await ensureArena(env.DB,timeControl); const now=new Date().toISOString(); const active=await env.DB.prepare(`SELECT 1 FROM arena_participants WHERE arena_id=? AND user_id=? AND left_at IS NULL`).bind(a.id,user.id).first(); if(active) await env.DB.batch([env.DB.prepare(`UPDATE arena_participants SET left_at=? WHERE arena_id=? AND user_id=? AND left_at IS NULL`).bind(now,a.id,user.id),env.DB.prepare(`INSERT INTO arena_join_log(id,arena_id,user_id,action,created_at) VALUES(?,?,?,?,?)`).bind(crypto.randomUUID(),a.id,user.id,'leave',now)]); return json({ok:true,joined:false}); }
+      catch { return json({error:'Arena çıkışı başarısız.'},{status:400}); }
+    }
+    if (url.pathname === '/api/matchmaking/join' && request.method === 'POST') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try { const b=await request.json() as any; const timeControl=String(b.timeControl||'10+0'); if(!TIME_CONTROLS[timeControl])return json({error:'Desteklenmeyen süre kontrolü.'},{status:400}); const arenaId=b.arenaId?String(b.arenaId):null; if(arenaId){ const joined=await env.DB.prepare(`SELECT 1 FROM arena_participants WHERE arena_id=? AND user_id=? AND left_at IS NULL`).bind(arenaId,user.id).first(); if(!joined)return json({error:'Önce bu arenaya katılmalısınız.'},{status:400}); } const r=await env.MATCHMAKING.get(env.MATCHMAKING.idFromName('global')).fetch('https://matchmaking.internal/join',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:user.id,rating:Number(user.rating||1200),timeControl,arenaId})}); const d=await r.json() as any; if(d.matched){ await Promise.all([notifyRealtime(env,user.id,{type:'matchmaking:found',match:d.match}),notifyRealtime(env,d.match.opponentUserId,{type:'matchmaking:found',match:{roomCode:d.match.roomCode,timeControl:d.match.timeControl,opponentUserId:user.id,opponentRating:Number(user.rating||1200)}})]); } return json(d,{status:r.status}); } catch(e){ return json({error:'Eşleşme kuyruğuna katılınamadı.'},{status:400}); }
+    }
+    if (url.pathname === '/api/matchmaking/leave' && request.method === 'POST') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try { const r=await env.MATCHMAKING.get(env.MATCHMAKING.idFromName('global')).fetch('https://matchmaking.internal/leave',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userId:user.id})}); return new Response(r.body,r); } catch { return json({error:'Kuyruktan çıkılamadı.'},{status:400}); }
+    }
+    if (url.pathname === '/api/matchmaking/status' && request.method === 'GET') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503}); const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try { const r=await env.MATCHMAKING.get(env.MATCHMAKING.idFromName('global')).fetch('https://matchmaking.internal/status?userId='+encodeURIComponent(user.id)); return new Response(r.body,r); } catch { return json({error:'Kuyruk durumu alınamadı.'},{status:400}); }
+    }
+    if (url.pathname === '/ws/social') {
+      if(request.headers.get('Upgrade')!=='websocket') return new Response('WebSocket required',{status:426});
+      const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      const id=env.SOCIAL.idFromName(user.id);
+      return env.SOCIAL.get(id).fetch(new Request('https://social.internal/connect',{headers:{'Upgrade':'websocket','x-zato-user-id':user.id}}));
+    }
     const analysisMatch = url.pathname.match(/^\/api\/games\/([^/]+)\/analysis$/);
     if (analysisMatch && request.method === 'POST') {
       if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
@@ -40,7 +593,7 @@ export default {
         const owned=await env.DB.prepare('SELECT id FROM games WHERE id=? AND (white_user_id=? OR black_user_id=?)').bind(gameId,user.id,user.id).first();
         if(!owned)return json({error:'Maç bulunamadı.'},{status:404});
         const body=await request.json() as any; const rows=Array.isArray(body.analysis)?body.analysis:[];
-        const stmts=rows.slice(0,500).map((x:any)=>env.DB!.prepare(`INSERT OR REPLACE INTO analyses(game_id,ply,engine,depth,score_cp,mate,best_move_uci,classification,explanation) VALUES(?,?,?,?,?,?,?,?,?)`).bind(gameId,Number(x.ply), 'Stockfish 19', Number(x.depth)||null, Number.isFinite(x.score_cp)?Number(x.score_cp):null, null, x.best_move_uci||null, String(x.classification||'').slice(0,32), `Centipawn loss: ${Number(x.loss)||0}`));
+        const stmts=rows.slice(0,500).map((x:any)=>env.DB!.prepare(`INSERT OR REPLACE INTO analyses(game_id,ply,engine,depth,score_cp,mate,best_move_uci,classification,explanation,loss_cp) VALUES(?,?,?,?,?,?,?,?,?,?)`).bind(gameId,Number(x.ply), 'Stockfish 19', Number(x.depth)||null, Number.isFinite(x.score_cp)?Number(x.score_cp):null, null, x.best_move_uci||null, String(x.classification||'').slice(0,32), `Centipawn loss: ${Number(x.loss)||0}`, Math.max(0,Math.round(Number(x.loss)||0))));
         if(stmts.length) await env.DB.batch(stmts);
         return json({ok:true,count:stmts.length});
       } catch { return json({error:'Analiz kaydedilemedi.'},{status:400}); }
@@ -124,10 +677,179 @@ export default {
       const rows=await env.DB.prepare(`SELECT id,username,display_name,rating FROM users WHERE id<>? AND (username LIKE ? OR display_name LIKE ?) ORDER BY rating DESC LIMIT 20`).bind(user.id,`%${q}%`,`%${q}%`).all();
       return json({players:rows.results||[]});
     }
+    if (url.pathname === '/api/presence/heartbeat' && request.method === 'POST') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      const sid=cookie(request,'zato_session'); if(!sid)return json({error:'Oturum bulunamadı.'},{status:401});
+      await env.DB.prepare(`INSERT INTO user_presence(user_id,session_id,last_seen_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(user_id) DO UPDATE SET session_id=excluded.session_id,last_seen_at=excluded.last_seen_at`).bind(user.id,sid).run();
+      return json({ok:true,lastSeenAt:new Date().toISOString()});
+    }
+    const rematchMatch = url.pathname.match(/^\/api\/games\/([^/]+)\/rematch$/);
+    if (rematchMatch && request.method === 'POST') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      const gameId=decodeURIComponent(rematchMatch[1]);
+      const game=await env.DB.prepare(`SELECT id,white_user_id,black_user_id,result,status FROM games WHERE id=? AND status='finished'`).bind(gameId).first<any>();
+      if(!game)return json({error:'Tamamlanmış maç bulunamadı.'},{status:404});
+      const opponentId=game.white_user_id===user.id?game.black_user_id:game.black_user_id===user.id?game.white_user_id:null;
+      if(!opponentId)return json({error:'Rakip bulunamadı.'},{status:400});
+      const friend=await env.DB.prepare(`SELECT 1 FROM friendships WHERE status='accepted' AND ((user_id=? AND friend_id=?) OR (user_id=? AND friend_id=?))`).bind(user.id,opponentId,opponentId,user.id).first();
+      if(!friend)return json({error:'Rematch yalnızca arkadaşınızla yapılabilir.'},{status:403});
+      const pending=await env.DB.prepare(`SELECT id,room_code,status FROM rematch_requests WHERE from_user_id=? AND to_user_id=? AND status='pending'`).bind(user.id,opponentId).first<any>();
+      if(pending)return json({ok:true,id:pending.id,roomCode:pending.room_code,status:'pending'});
+      const id=crypto.randomUUID(), roomCode=Math.random().toString(36).slice(2,8).toUpperCase(), expires=new Date(Date.now()+10*60*1000).toISOString();
+      await env.DB.prepare(`INSERT INTO rematch_requests(id,game_id,from_user_id,to_user_id,room_code,status,expires_at) VALUES(?,?,?,?,?,'pending',?)`).bind(id,gameId,user.id,opponentId,roomCode,expires).run();
+      await notify(env.DB,env,opponentId,'rematch_request','Yeni rövanş teklifi',`${user.display_name} yeniden maç yapmak istiyor.`,{rematchId:id,gameId,roomCode,expiresAt:expires});
+      return json({ok:true,id,roomCode,status:'pending',expiresAt:expires});
+    }
+    if (url.pathname === '/api/rematches' && request.method === 'GET') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      await env.DB.prepare(`UPDATE rematch_requests SET status='expired' WHERE to_user_id=? AND status='pending' AND expires_at<=?`).bind(user.id,new Date().toISOString()).run();
+      const rows=await env.DB.prepare(`SELECT r.id,r.game_id,r.room_code,r.created_at,r.expires_at,u.id user_id,u.username,u.display_name,u.rating FROM rematch_requests r JOIN users u ON u.id=r.from_user_id WHERE r.to_user_id=? AND r.status='pending' ORDER BY r.created_at DESC LIMIT 20`).bind(user.id).all();
+      return json({rematches:rows.results||[]});
+    }
+    if (url.pathname === '/api/rematches/respond' && request.method === 'POST') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try { const body=await request.json() as any; const id=String(body.id||''); const accepted=Boolean(body.accepted); const r=await env.DB.prepare(`SELECT id,from_user_id,room_code,expires_at FROM rematch_requests WHERE id=? AND to_user_id=? AND status='pending'`).bind(id,user.id).first<any>(); if(!r)return json({error:'Rövanş teklifi bulunamadı.'},{status:404}); if(new Date(r.expires_at).getTime()<=Date.now()){await env.DB.prepare(`UPDATE rematch_requests SET status='expired' WHERE id=?`).bind(id).run();return json({error:'Rövanş teklifinin süresi dolmuş.'},{status:410});} const status=accepted?'accepted':'declined'; await env.DB.prepare(`UPDATE rematch_requests SET status=? WHERE id=?`).bind(status,id).run(); await notify(env.DB,env,r.from_user_id,accepted?'rematch_accepted':'rematch_declined',accepted?'Rövanş kabul edildi':'Rövanş reddedildi',accepted?`${user.display_name} rövanş teklifini kabul etti.`:`${user.display_name} rövanş teklifini reddetti.`,{rematchId:id,roomCode:accepted?r.room_code:null}); return json({ok:true,status,roomCode:accepted?r.room_code:null}); } catch { return json({error:'Rövanş yanıtlanamadı.'},{status:400}); }
+    }
+    if (url.pathname === '/api/notifications' && request.method === 'GET') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      const rows=await env.DB.prepare(`SELECT id,type,title,body,payload_json,read_at,created_at FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 30`).bind(user.id).all();
+      return json({notifications:(rows.results||[]).map((n:any)=>({...n,payload:n.payload_json?JSON.parse(n.payload_json):{}}))});
+    }
+    if (url.pathname === '/api/notifications/read' && request.method === 'POST') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      try { const body=await request.json() as any; if(body.all) await env.DB.prepare(`UPDATE notifications SET read_at=CURRENT_TIMESTAMP WHERE user_id=? AND read_at IS NULL`).bind(user.id).run(); else { const id=String(body.id||''); await env.DB.prepare(`UPDATE notifications SET read_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?`).bind(id,user.id).run(); } return json({ok:true}); } catch { return json({error:'Bildirim güncellenemedi.'},{status:400}); }
+    }
+    const profileMatch = url.pathname.match(/^\/api\/players\/([^/]+)\/profile$/);
+    const gameDetailMatch = url.pathname.match(/^\/api\/games\/([^/]+)$/);
+    if (gameDetailMatch && request.method === 'GET') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const viewer=await authUser(request,env); if(!viewer)return json({error:'Giriş gerekli.'},{status:401});
+      const gameId=decodeURIComponent(gameDetailMatch[1]);
+      const game=await env.DB.prepare(`SELECT id,white_user_id,black_user_id,white_name,black_name,time_control,result,status,pgn,initial_fen,final_fen,started_at,ended_at FROM games WHERE id=? AND (white_user_id=? OR black_user_id=?)`).bind(gameId,viewer.id,viewer.id).first<any>();
+      if(!game)return json({error:'Maç bulunamadı.'},{status:404});
+      const moves=await env.DB.prepare(`SELECT ply,san,uci,fen_after,clock_white,clock_black,created_at FROM moves WHERE game_id=? ORDER BY ply ASC`).bind(gameId).all();
+      const analyses=await env.DB.prepare(`SELECT ply,engine,depth,score_cp,mate,best_move_uci,classification,explanation,loss_cp FROM analyses WHERE game_id=? ORDER BY ply ASC`).bind(gameId).all();
+      const analysisRows=analyses.results||[];
+      const losses=analysisRows.map((a:any)=>Number(a.loss_cp)).filter((n:number)=>Number.isFinite(n));
+      const acpl=losses.length?Math.round(losses.reduce((a:number,b:number)=>a+b,0)/losses.length):null;
+      const accuracy=losses.length?Math.max(0,Math.min(100,Math.round(100*Math.exp(-acpl/120)))):null;
+      const counts=analysisRows.reduce((m:any,a:any)=>{const k=String(a.classification||'').toLowerCase();m[k]=(m[k]||0)+1;return m;},{});
+      const opening=classifyOpening((moves.results||[]).map((m:any)=>m.san));
+      return json({game,moves:moves.results||[],analyses:analysisRows,stats:{acpl,accuracy,analyzedMoves:losses.length,classifications:counts},opening});
+    }
+
+    if (url.pathname === '/api/system/status' && request.method === 'GET') {
+      if(!env.DB) return json({ready:false,error:'D1 yapılandırılmamış.'},{status:503});
+      try {
+        const tables=await env.DB.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name IN ('users','games','moves','analyses','rating_history','notification_preferences','push_subscriptions','friendships','notifications','rematch_requests','season_player_stats','seasons','season_game_results','season_rewards','matchmaking_queue','arena_events','arena_participants','arena_join_log','cup_events','cup_participants','cup_rewards')`).all<any>();
+        const names=new Set((tables.results||[]).map((x:any)=>x.name));
+        const cols=await env.DB.prepare(`PRAGMA table_info(analyses)`).all<any>();
+        const hasLossCp=(cols.results||[]).some((x:any)=>x.name==='loss_cp');
+        const required=['users','games','moves','analyses','rating_history','notification_preferences','push_subscriptions','friendships','notifications','rematch_requests','season_player_stats','seasons','season_game_results','season_rewards','matchmaking_queue','arena_events','arena_participants','arena_join_log','cup_events','cup_participants','cup_rewards','tournaments','tournament_players','tournament_matches','tournament_rewards','tournament_shares','tournament_share_abuse_windows','tournament_share_audit','tournament_share_audit_daily','tournament_share_cache_daily','tournament_share_alert_history'];
+        const missing=required.filter(x=>!names.has(x));
+        return json({ready:missing.length===0&&hasLossCp,version:'63.0.0',database:{ready:missing.length===0&&hasLossCp,missing,lossCp:hasLossCp},bindings:{rooms:Boolean(env.ROOMS),social:Boolean(env.SOCIAL),matchmaking:Boolean(env.MATCHMAKING)},push:{configured:Boolean(env.VAPID_PUBLIC_KEY&&env.VAPID_PRIVATE_JWK&&env.VAPID_SUBJECT)},migration:{v47:'tournament-round-analytics-and-entry-rating',v46:'tournament-analytics-profile-and-history',v45:'standings-and-rating-neutral-tiebreaks',v43:true,v44:'tournament-replay-tiebreak-and-history',v31:'loss_cp',v32:'indexes-and-readiness',v33:'competitive-seasons-and-rank-tiers',v34:'season-snapshots-and-competitive-leaderboard',v35:'season-lifecycle-backfill-rewards',v36:'season-history-and-trend-visualization',v37:'smoke-test-and-matchmaking',v38:'arena-live-scoring-and-observability',v39:'arena-rewards-and-player-metrics',v40:'arena-lifecycle-history-streaks-and-observability',v41:'anti-abuse-daily-weekly-cups-and-regression-tooling',v42:'tournament-brackets-and-spectator-mode',v49:'public-tournament-share',v50:'share-analytics-og-image-and-readonly-replay',v51:'share-token-expiration-rotation-privacy-controls-and-replay-autoplay',v52:'public-share-rate-limiting-daily-privacy-safe-analytics-and-replay-state',v53:'public-share-cache-etag-analytics-and-replay-controls',v54:'share-abuse-telemetry-cache-aware-accounting-and-route-health',v55:'share-health-ux-cache-diagnostics-link-regeneration-route-simulation',v56:'share-html-etag-rotation-audit-and-public-route-contracts',v57:'share-audit-retention-aggregation-cache-diagnostics-and-304-accounting',v58:'share-health-dashboard-alerts-audit-trends-and-cleanup-simulation',v59:'cache-aware-analytics-alert-history-health-export-and-scheduled-retention',v60:'export-integrity-cache-aggregation-alert-acknowledgement-and-deterministic-maintenance',v61:'export-verification-alert-lifecycle-maintenance-diagnostics',v62:'export-canonical-hash-alert-audit-maintenance-error-telemetry',v63:'export-signature-key-rotation-alert-audit-filters-maintenance-replay-route-contracts',v64:'signed-export-verification-key-lifecycle-replay-diff-alert-pagination-route-matrix'}});
+      } catch { return json({ready:false,error:'Sistem durumu okunamadı.'},{status:500}); }
+    }
+    if (url.pathname === '/api/leaderboard' && request.method === 'GET') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const viewer=await authUser(request,env); if(!viewer)return json({error:'Giriş gerekli.'},{status:401});
+      try {
+        const limit=Math.min(100,Math.max(10,Number(url.searchParams.get('limit')||50)));
+        const offset=Math.max(0,Number(url.searchParams.get('offset')||0));
+        const scope=url.searchParams.get('scope')==='friends'?'friends':'global';
+        const timeControl=(url.searchParams.get('timeControl')||'').trim();
+        let where='1=1'; const binds:any[]=[];
+        if(scope==='friends'){ where=`id IN (SELECT friend_id FROM friendships WHERE user_id=? AND status='accepted' UNION SELECT user_id FROM friendships WHERE friend_id=? AND status='accepted') OR id=?`; binds.push(viewer.id,viewer.id,viewer.id); }
+        if(timeControl){ where+=` AND id IN (SELECT white_user_id FROM games WHERE time_control=? UNION SELECT black_user_id FROM games WHERE time_control=?)`; binds.push(timeControl,timeControl); }
+        const sql=`SELECT id,username,display_name,rating,games_played,wins,draws,losses FROM users WHERE ${where} ORDER BY rating DESC, games_played DESC, created_at ASC LIMIT ? OFFSET ?`;
+        binds.push(limit+1,offset);
+        const rows=await env.DB.prepare(sql).bind(...binds).all<any>();
+        const rawPlayers=rows.results||[]; const hasMore=rawPlayers.length>limit; const players=rawPlayers.slice(0,limit).map((p:any,i:number)=>({...p,rank:offset+i+1,winRate:Number(p.games_played||0)?Math.round(Number(p.wins||0)/Number(p.games_played||0)*100):0,tier:rankTier(Number(p.rating||0))}));
+        const rankWhere=scope==='friends'?`id IN (SELECT friend_id FROM friendships WHERE user_id=? AND status='accepted' UNION SELECT user_id FROM friendships WHERE friend_id=? AND status='accepted') OR id=?`:'1=1';
+        const rankBinds=scope==='friends'?[viewer.id,viewer.id,viewer.id]:[];
+        const tcClause=timeControl?' AND id IN (SELECT white_user_id FROM games WHERE time_control=? UNION SELECT black_user_id FROM games WHERE time_control=?)':'';
+        if(timeControl) rankBinds.push(timeControl,timeControl);
+        const viewerRank=await env.DB.prepare(`SELECT COUNT(*)+1 AS rank FROM users WHERE (${rankWhere}) ${tcClause} AND rating > (SELECT rating FROM users WHERE id=?)`).bind(...rankBinds,viewer.id).first<any>();
+        return json({players,viewerRank:Number(viewerRank?.rank||0),limit,offset,hasMore,scope,timeControl:timeControl||null});
+      } catch { return json({error:'Liderlik tablosu yüklenemedi.'},{status:400}); }
+    }
+    if (url.pathname === '/api/season' && request.method === 'GET') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const viewer=await authUser(request,env); if(!viewer)return json({error:'Giriş gerekli.'},{status:401});
+      const season=seasonInfo();
+      try { await ensureSeasonLifecycle(env.DB,season); await backfillSeason(env.DB,season);
+        const row=await env.DB.prepare(`SELECT id,username,display_name,rating,games_played,wins,draws,losses FROM users WHERE id=?`).bind(viewer.id).first<any>();
+        const snap=await env.DB.prepare(`SELECT * FROM season_player_stats WHERE season_id=? AND user_id=?`).bind(season.id,viewer.id).first<any>();
+        const stats=snap?{games:Number(snap.games||0),wins:Number(snap.wins||0),draws:Number(snap.draws||0),losses:Number(snap.losses||0),winRate:Number(snap.games||0)?Math.round(Number(snap.wins||0)/Number(snap.games||0)*100):0,startRating:Number(snap.start_rating||row?.rating||1200),currentRating:Number(snap.current_rating||row?.rating||1200),peakRating:Number(snap.peak_rating||row?.rating||1200),ratingDelta:Number(snap.rating_delta||0)}:{games:0,wins:0,draws:0,losses:0,winRate:0,startRating:Number(row?.rating||1200),currentRating:Number(row?.rating||1200),peakRating:Number(row?.rating||1200),ratingDelta:0};
+        const movement=tierMovement(stats.startRating,stats.currentRating);
+        const rank=await env.DB.prepare(`SELECT COUNT(*)+1 rank FROM season_player_stats WHERE season_id=? AND games>0 AND (current_rating>? OR (current_rating=? AND games>?))`).bind(season.id,stats.currentRating,stats.currentRating,stats.games).first<any>();
+        const reward=await env.DB.prepare(`SELECT rank,tier,reward_key FROM season_rewards WHERE season_id=? AND user_id=?`).bind(season.id,viewer.id).first<any>(); return json({season,player:{id:viewer.id,rating:Number(row?.rating||1200),tier:rankTier(Number(row?.rating||1200))},stats:{...stats,rank:Number(rank?.rank||1),movement},reward:reward||null});
+      } catch { return json({error:'Sezon verisi yüklenemedi.'},{status:400}); }
+    }
+    if (url.pathname === '/api/seasons/history' && request.method === 'GET') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const viewer=await authUser(request,env); if(!viewer)return json({error:'Giriş gerekli.'},{status:401});
+      try {
+        const rows=(await env.DB.prepare(`SELECT s.id,s.label,s.starts_at,s.ends_at,s.status,s.finalized_at,sp.games,sp.wins,sp.draws,sp.losses,sp.start_rating,sp.current_rating,sp.peak_rating,sp.rating_delta,r.rank,r.tier,r.reward_key FROM seasons s LEFT JOIN season_player_stats sp ON sp.season_id=s.id AND sp.user_id=? LEFT JOIN season_rewards r ON r.season_id=s.id AND r.user_id=? ORDER BY s.starts_at DESC LIMIT 12`).bind(viewer.id,viewer.id).all()).results||[];
+        const seasons=rows.map((s:any)=>({...s,games:Number(s.games||0),wins:Number(s.wins||0),draws:Number(s.draws||0),losses:Number(s.losses||0),startRating:Number(s.start_rating||0),currentRating:Number(s.current_rating||0),peakRating:Number(s.peak_rating||0),ratingDelta:Number(s.rating_delta||0),winRate:Number(s.games||0)?Math.round(Number(s.wins||0)/Number(s.games||0)*100):0,tier:rankTier(Number(s.current_rating||s.start_rating||1200)),reward:s.reward_key?{rank:Number(s.rank),tier:s.tier,rewardKey:s.reward_key}:null}));
+        return json({seasons});
+      } catch { return json({error:'Sezon geçmişi yüklenemedi.'},{status:400}); }
+    }
+    if (url.pathname === '/api/season/leaderboard' && request.method === 'GET') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const viewer=await authUser(request,env); if(!viewer)return json({error:'Giriş gerekli.'},{status:401});
+      const season=seasonInfo();
+      try { await ensureSeasonLifecycle(env.DB,season); await backfillSeason(env.DB,season);
+        const limit=Math.min(100,Math.max(10,Number(url.searchParams.get('limit')||50))); const offset=Math.max(0,Number(url.searchParams.get('offset')||0));
+        const rows=await env.DB.prepare(`SELECT s.user_id id,u.username,u.display_name,s.games,s.wins,s.draws,s.losses,s.start_rating,s.current_rating,s.peak_rating,s.rating_delta FROM season_player_stats s JOIN users u ON u.id=s.user_id WHERE s.season_id=? AND s.games>0 ORDER BY s.current_rating DESC,s.rating_delta DESC,s.games DESC LIMIT ? OFFSET ?`).bind(season.id,limit+1,offset).all<any>();
+        const raw=rows.results||[]; const hasMore=raw.length>limit; const players=raw.slice(0,limit).map((p:any,i:number)=>({...p,rank:offset+i+1,winRate:Number(p.games)?Math.round(Number(p.wins)/Number(p.games)*100):0,tier:rankTier(Number(p.current_rating||0)),movement:tierMovement(Number(p.start_rating||p.current_rating||1200),Number(p.current_rating||1200))}));
+        const vr=await env.DB.prepare(`SELECT COUNT(*)+1 rank FROM season_player_stats WHERE season_id=? AND games>0 AND (current_rating>(SELECT current_rating FROM season_player_stats WHERE season_id=? AND user_id=?) OR (current_rating=(SELECT current_rating FROM season_player_stats WHERE season_id=? AND user_id=?) AND games>(SELECT games FROM season_player_stats WHERE season_id=? AND user_id=?)))`).bind(season.id,season.id,viewer.id,season.id,viewer.id,season.id,viewer.id).first<any>();
+        return json({season,players,viewerRank:Number(vr?.rank||0),limit,offset,hasMore});
+      } catch { return json({error:'Sezon liderlik tablosu yüklenemedi.'},{status:400}); }
+    }
+    if (profileMatch && request.method === 'GET') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const viewer=await authUser(request,env); if(!viewer)return json({error:'Giriş gerekli.'},{status:401});
+      try {
+        const playerId=decodeURIComponent(profileMatch[1]);
+        const player=await env.DB.prepare(`SELECT id,username,display_name,rating,games_played,wins,draws,losses,created_at FROM users WHERE id=?`).bind(playerId).first<any>();
+        if(!player)return json({error:'Oyuncu bulunamadı.'},{status:404});
+        const friend=viewer.id===playerId ? true : Boolean(await env.DB.prepare(`SELECT 1 FROM friendships WHERE user_id=? AND friend_id=? AND status='accepted'`).bind(viewer.id,playerId).first());
+        const offset=Math.max(0,Number(url.searchParams.get('offset')||0)); const limit=Math.min(20,Math.max(1,Number(url.searchParams.get('limit')||12)));
+        const recent=await env.DB.prepare(`SELECT g.id,g.white_user_id,g.black_user_id,g.white_name,g.black_name,g.time_control,g.result,g.status,g.started_at,g.ended_at, a.acpl,a.analyzed_moves FROM games g LEFT JOIN (SELECT game_id,ROUND(AVG(loss_cp),0) acpl,COUNT(loss_cp) analyzed_moves FROM analyses WHERE loss_cp>0 GROUP BY game_id) a ON a.game_id=g.id WHERE (g.white_user_id=? OR g.black_user_id=?) AND g.status='finished' ORDER BY g.ended_at DESC,g.started_at DESC LIMIT ? OFFSET ?`).bind(playerId,playerId,limit+1,offset).all();
+        const opponent=viewer.id===playerId?null:await env.DB.prepare(`SELECT COUNT(*) games, SUM(CASE WHEN result='1/2-1/2' THEN 1 ELSE 0 END) draws, SUM(CASE WHEN (white_user_id=? AND result='1-0') OR (black_user_id=? AND result='0-1') THEN 1 ELSE 0 END) wins, SUM(CASE WHEN (white_user_id=? AND result='0-1') OR (black_user_id=? AND result='1-0') THEN 1 ELSE 0 END) losses FROM games WHERE status='finished' AND ((white_user_id=? AND black_user_id=?) OR (white_user_id=? AND black_user_id=?))`).bind(playerId,playerId,playerId,playerId,playerId,viewer.id,viewer.id,playerId).first<any>();
+        const rawRecent=recent.results||[]; const hasMore=rawRecent.length>limit; const recentGames=rawRecent.slice(0,limit).map((g:any)=>({id:g.id,opponentUserId:g.white_user_id===playerId?g.black_user_id:g.white_user_id,opponentName:g.white_user_id===playerId?g.black_name:g.white_name,color:g.white_user_id===playerId?'white':'black',result:g.result,timeControl:g.time_control,startedAt:g.started_at,endedAt:g.ended_at,acpl:g.acpl!=null?Number(g.acpl):null,analyzedMoves:Number(g.analyzed_moves||0)}));
+        const ratingHistory=(await env.DB.prepare(`SELECT game_id,old_rating,new_rating,delta,created_at FROM rating_history WHERE user_id=? ORDER BY created_at DESC LIMIT 30`).bind(playerId).all()).results||[];
+        const arenaStats=await env.DB.prepare(`SELECT COUNT(DISTINCT ap.arena_id) arenas,COUNT(DISTINCT g.id) games,COALESCE(SUM(CASE WHEN ((g.white_user_id=ap.user_id AND g.result='1-0') OR (g.black_user_id=ap.user_id AND g.result='0-1')) THEN 1 ELSE 0 END),0) wins,COALESCE(SUM(CASE WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) draws,COALESCE(SUM(CASE WHEN ((g.white_user_id=ap.user_id AND g.result='1-0') OR (g.black_user_id=ap.user_id AND g.result='0-1')) THEN 2 WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) points FROM arena_participants ap LEFT JOIN arena_participants op ON op.arena_id=ap.arena_id AND op.user_id<>ap.user_id LEFT JOIN games g ON g.status='finished' AND g.ended_at>=ap.joined_at AND (ap.left_at IS NULL OR g.ended_at<=ap.left_at) AND ((g.white_user_id=ap.user_id AND g.black_user_id=op.user_id) OR (g.black_user_id=ap.user_id AND g.white_user_id=op.user_id)) WHERE ap.user_id=?`).bind(playerId).first<any>();
+        const arenaRewards=(await env.DB.prepare(`SELECT arena_id,rank,reward_key,points,created_at FROM arena_rewards WHERE user_id=? ORDER BY created_at DESC LIMIT 12`).bind(playerId).all()).results||[];
+        const statRows=(await env.DB.prepare(`SELECT id,white_user_id,black_user_id,result,ended_at FROM games WHERE status='finished' AND (white_user_id=? OR black_user_id=?) ORDER BY ended_at DESC LIMIT 50`).bind(playerId,playerId).all()).results||[];
+        let streak=0,bestWinStreak=0,bestLossStreak=0,currentType=''; let run=0; let opponentRatingSum=0,opponentRatingCount=0;
+        for(const g of statRows){ const color=g.white_user_id===playerId?'white':'black'; const won=(color==='white'&&g.result==='1-0')||(color==='black'&&g.result==='0-1'); const draw=g.result==='1/2-1/2'; const type=draw?'D':won?'W':'L'; if(!currentType)currentType=type; if(run===0){currentType=type;run=1;} else if(type===currentType)run++; else {if(currentType==='W')bestWinStreak=Math.max(bestWinStreak,run);if(currentType==='L')bestLossStreak=Math.max(bestLossStreak,run);currentType=type;run=1;}
+          const oppId=color==='white'?g.black_user_id:g.white_user_id; if(oppId){ const rh=await env.DB.prepare(`SELECT old_rating FROM rating_history WHERE game_id=? AND user_id=? LIMIT 1`).bind(g.id,oppId).first<any>(); if(rh){opponentRatingSum+=Number(rh.old_rating);opponentRatingCount++;} }
+        }
+        if(currentType==='W')bestWinStreak=Math.max(bestWinStreak,run); if(currentType==='L')bestLossStreak=Math.max(bestLossStreak,run);
+        const currentStreak=run; const avgOpponentRating=opponentRatingCount?Math.round(opponentRatingSum/opponentRatingCount):null;
+        const form=recentGames.slice(0,10).map((g:any)=>{const won=(g.color==='white'&&g.result==='1-0')||(g.color==='black'&&g.result==='0-1'); return g.result==='1/2-1/2'?'D':won?'W':'L';});
+        const rankRow=await env.DB.prepare(`SELECT COUNT(*)+1 AS rank FROM users WHERE rating > ?`).bind(Number(player.rating)).first<any>();
+        const accuracyTrend=(await env.DB.prepare(`SELECT g.id,g.ended_at,ROUND(AVG(a.loss_cp),0) acpl,COUNT(a.loss_cp) analyzed_moves FROM games g JOIN analyses a ON a.game_id=g.id WHERE g.status='finished' AND (g.white_user_id=? OR g.black_user_id=?) AND a.loss_cp>=0 GROUP BY g.id ORDER BY g.ended_at DESC LIMIT 20`).bind(playerId,playerId).all()).results||[];
+        const tournamentRows=(await env.DB.prepare(`SELECT t.id,t.name,t.status,t.ends_at,t.tiebreak_mode,m.round,m.match_no,m.player1_id,m.player2_id,m.winner_id,m.tie_break,m.winner_reason,m.tiebreak_game_id,m.game_id,p1.rating_at_entry player1_entry_rating,p2.rating_at_entry player2_entry_rating,tr.rank FROM tournament_players tp JOIN tournaments t ON t.id=tp.tournament_id LEFT JOIN tournament_matches m ON m.tournament_id=t.id AND (m.player1_id=? OR m.player2_id=?) LEFT JOIN tournament_players p1 ON p1.tournament_id=m.tournament_id AND p1.user_id=m.player1_id LEFT JOIN tournament_players p2 ON p2.tournament_id=m.tournament_id AND p2.user_id=m.player2_id LEFT JOIN tournament_rewards tr ON tr.tournament_id=t.id AND tr.user_id=? WHERE tp.user_id=? ORDER BY COALESCE(t.ends_at,t.created_at) DESC,t.created_at DESC LIMIT 60`).bind(playerId,playerId,playerId,playerId).all()).results||[];
+        const tournamentIds=[...new Set(tournamentRows.map((r:any)=>r.id).filter(Boolean))];
+        const tournamentStats={tournaments:tournamentIds.length,games:tournamentRows.filter((r:any)=>r.winner_id||r.game_id||r.tiebreak_game_id).length,wins:tournamentRows.filter((r:any)=>r.winner_id===playerId).length,losses:tournamentRows.filter((r:any)=>r.winner_id&&r.winner_id!==playerId&&((r.player1_id===playerId)||(r.player2_id===playerId))).length,tieBreaks:tournamentRows.filter((r:any)=>r.tie_break&&r.tie_break!=='none').length,tieBreakWins:tournamentRows.filter((r:any)=>r.winner_id===playerId&&r.tie_break&&r.tie_break!=='none').length,championships:tournamentRows.filter((r:any)=>Number(r.rank)===1).length,runnerUps:tournamentRows.filter((r:any)=>Number(r.rank)===2).length};
+        const tournamentHistory=tournamentIds.map((id:string)=>{const rows=tournamentRows.filter((r:any)=>r.id===id);const reward=rows.find((r:any)=>r.rank!=null)?.rank;const wins=rows.filter((r:any)=>r.winner_id===playerId).length;const losses=rows.filter((r:any)=>r.winner_id&&r.winner_id!==playerId&&((r.player1_id===playerId)||(r.player2_id===playerId))).length;const opponents=rows.flatMap((r:any)=>{if(!r.player1_id||!r.player2_id)return[];return [r.player1_id===playerId?Number(r.player2_entry_rating||0):Number(r.player1_entry_rating||0)];}).filter((n:number)=>n>0);const tieBreaks=rows.filter((r:any)=>r.tie_break&&r.tie_break!=='none');return {id,name:rows[0]?.name,status:rows[0]?.status,endsAt:rows[0]?.ends_at,tiebreakMode:rows[0]?.tiebreak_mode,wins,losses,tieBreaks:tieBreaks.length,tieBreakWins:tieBreaks.filter((r:any)=>r.winner_id===playerId).length,rewardRank:reward??null,averageOpponentRating:opponents.length?Math.round(opponents.reduce((a:number,b:number)=>a+b,0)/opponents.length):null,tieBreakHistory:tieBreaks.map((r:any)=>({round:Number(r.round),matchNo:Number(r.match_no),mode:r.tie_break,reason:r.winner_reason,gameId:r.game_id,tiebreakGameId:r.tiebreak_game_id,winnerId:r.winner_id}))};});
+        const stats={winRate:Number(player.games_played||0)?Math.round(Number(player.wins||0)/Number(player.games_played||0)*100):0,drawRate:Number(player.games_played||0)?Math.round(Number(player.draws||0)/Number(player.games_played||0)*100):0,avgOpponentRating,currentStreak,currentStreakType:currentType,bestWinStreak,bestLossStreak,rank:Number(rankRow?.rank||0)};
+        return json({player:{...player,tier:rankTier(Number(player.rating||0))},friend,recentGames,offset,limit,hasMore,form,ratingHistory,accuracyTrend,tournamentStats,tournamentHistory,arenaStats:{arenas:Number(arenaStats?.arenas||0),games:Number(arenaStats?.games||0),wins:Number(arenaStats?.wins||0),draws:Number(arenaStats?.draws||0),losses:Math.max(0,Number(arenaStats?.games||0)-Number(arenaStats?.wins||0)-Number(arenaStats?.draws||0)),points:Number(arenaStats?.points||0),winRate:Number(arenaStats?.games||0)?Math.round(Number(arenaStats?.wins||0)*1000/Number(arenaStats?.games||0))/10:0},arenaRewards,stats:{...stats,tier:rankTier(Number(player.rating||0))},headToHead:opponent?{games:Number(opponent.games||0),wins:Number(opponent.wins||0),draws:Number(opponent.draws||0),losses:Number(opponent.losses||0)}:null});
+      } catch { return json({error:'Profil yüklenemedi.'},{status:400}); }
+    }
     if (url.pathname === '/api/friends' && request.method === 'GET') {
       if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
       const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
-      const rows=await env.DB.prepare(`SELECT f.user_id,f.friend_id,f.status,f.created_at,u.username,u.display_name,u.rating FROM friendships f JOIN users u ON u.id=CASE WHEN f.user_id=? THEN f.friend_id ELSE f.user_id END WHERE (f.user_id=? OR f.friend_id=?) ORDER BY f.updated_at DESC`).bind(user.id,user.id,user.id).all();
+      const rows=await env.DB.prepare(`SELECT f.user_id,f.friend_id,f.status,f.created_at,u.username,u.display_name,u.rating,p.last_seen_at AS last_seen_at,CASE WHEN p.last_seen_at IS NOT NULL AND p.last_seen_at>=datetime('now','-45 seconds') THEN 1 ELSE 0 END AS online FROM friendships f JOIN users u ON u.id=CASE WHEN f.user_id=? THEN f.friend_id ELSE f.user_id END LEFT JOIN user_presence p ON p.user_id=u.id WHERE (f.user_id=? OR f.friend_id=?) ORDER BY online DESC,f.updated_at DESC`).bind(user.id,user.id,user.id).all();
       return json({friends:rows.results||[]});
     }
     if (url.pathname === '/api/friends/request' && request.method === 'POST') {
@@ -139,6 +861,7 @@ export default {
         if(existing?.status==='accepted')return json({error:'Zaten arkadaşsınız.'},{status:409});
         if(existing?.status==='pending')return json({error:'Bekleyen arkadaşlık isteği var.'},{status:409});
         await env.DB.prepare(`INSERT OR REPLACE INTO friendships(user_id,friend_id,status,updated_at) VALUES(?,?,?,CURRENT_TIMESTAMP)`).bind(user.id,friendId,'pending').run();
+        await notify(env.DB,env,friendId,'friend_request','Yeni arkadaşlık isteği',`${user.display_name} sana arkadaşlık isteği gönderdi.`,{fromUserId:user.id});
         return json({ok:true,status:'pending'});
       } catch { return json({error:'Arkadaşlık isteği gönderilemedi.'},{status:400}); }
     }
@@ -148,10 +871,16 @@ export default {
       try { const body=await request.json() as any; const fromId=String(body.userId||''); const accepted=Boolean(body.accepted); if(!fromId||fromId===user.id)return json({error:'Geçersiz oyuncu.'},{status:400});
         const reqRow=await env.DB.prepare(`SELECT status FROM friendships WHERE user_id=? AND friend_id=?`).bind(fromId,user.id).first<any>();
         if(!reqRow||reqRow.status!=='pending')return json({error:'İstek bulunamadı.'},{status:404});
-        if(accepted){ await env.DB.batch([env.DB.prepare(`UPDATE friendships SET status='accepted',updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND friend_id=?`).bind(fromId,user.id),env.DB.prepare(`INSERT OR REPLACE INTO friendships(user_id,friend_id,status,updated_at) VALUES(?,?,?,CURRENT_TIMESTAMP)`).bind(user.id,fromId,'accepted')]); }
-        else await env.DB.prepare(`DELETE FROM friendships WHERE user_id=? AND friend_id=?`).bind(fromId,user.id).run();
+        if(accepted){ await env.DB.batch([env.DB.prepare(`UPDATE friendships SET status='accepted',updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND friend_id=?`).bind(fromId,user.id),env.DB.prepare(`INSERT OR REPLACE INTO friendships(user_id,friend_id,status,updated_at) VALUES(?,?,?,CURRENT_TIMESTAMP)`).bind(user.id,fromId,'accepted')]); await notify(env.DB,env,fromId,'friend_accepted','Arkadaşlık kabul edildi',`${user.display_name} arkadaşlık isteğini kabul etti.`,{userId:user.id}); }
+        else { await env.DB.prepare(`DELETE FROM friendships WHERE user_id=? AND friend_id=?`).bind(fromId,user.id).run(); await notify(env.DB,env,fromId,'friend_declined','Arkadaşlık isteği reddedildi',`${user.display_name} arkadaşlık isteğini reddetti.`,{userId:user.id}); }
         return json({ok:true,status:accepted?'accepted':'rejected'});
       } catch { return json({error:'İstek yanıtlanamadı.'},{status:400}); }
+    }
+    if (url.pathname === '/api/invites/sent' && request.method === 'GET') {
+      if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
+      await env.DB.prepare(`UPDATE game_invites SET status='expired' WHERE from_user_id=? AND status='pending' AND expires_at<=?`).bind(user.id,new Date().toISOString()).run(); const rows=await env.DB.prepare(`SELECT i.id,i.room_code,i.created_at,i.expires_at,i.status,u.username,u.display_name,u.rating FROM game_invites i JOIN users u ON u.id=i.to_user_id WHERE i.from_user_id=? ORDER BY i.created_at DESC LIMIT 20`).bind(user.id).all();
+      return json({invites:rows.results||[]});
     }
     if (url.pathname === '/api/invites' && request.method === 'GET') {
       if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
@@ -170,7 +899,7 @@ export default {
         const existing=await env.DB.prepare("SELECT id FROM game_invites WHERE from_user_id=? AND to_user_id=? AND status='pending'").bind(user.id,toId).first();
         if(existing)return json({error:'Bu oyuncuya zaten bekleyen davet var.'},{status:409});
         const id=crypto.randomUUID(), code=crypto.randomUUID().replaceAll('-','').slice(0,6).toUpperCase(), expires=new Date(Date.now()+10*60*1000).toISOString();
-        await env.DB.prepare('INSERT INTO game_invites(id,from_user_id,to_user_id,room_code,expires_at) VALUES(?,?,?,?,?)').bind(id,user.id,toId,code,expires).run();
+        await env.DB.prepare('INSERT INTO game_invites(id,from_user_id,to_user_id,room_code,expires_at) VALUES(?,?,?,?,?)').bind(id,user.id,toId,code,expires).run(); await notify(env.DB,env,toId,'game_invite','Yeni oyun daveti',`${user.display_name} seninle satranç oynamak istiyor.`,{inviteId:id,roomCode:code,expiresAt:expires,fromUserId:user.id});
         return json({ok:true,id,roomCode:code,expiresAt:expires});
       } catch { return json({error:'Davet oluşturulamadı.'},{status:400}); }
     }
@@ -178,10 +907,10 @@ export default {
       if(!env.DB) return json({error:'D1 yapılandırılmamış.'},{status:503});
       const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
       try { const body=await request.json() as any; const id=String(body.id||''); const accepted=Boolean(body.accepted);
-        const inv=await env.DB.prepare("SELECT id,room_code,expires_at FROM game_invites WHERE id=? AND to_user_id=? AND status='pending'").bind(id,user.id).first<any>();
+        const inv=await env.DB.prepare("SELECT id,from_user_id,room_code,expires_at FROM game_invites WHERE id=? AND to_user_id=? AND status='pending'").bind(id,user.id).first<any>();
         if(!inv)return json({error:'Davet bulunamadı.'},{status:404});
         if(new Date(inv.expires_at).getTime()<=Date.now()){await env.DB.prepare("UPDATE game_invites SET status='expired' WHERE id=?").bind(id).run();return json({error:'Davetin süresi dolmuş.'},{status:410});}
-        await env.DB.prepare('UPDATE game_invites SET status=? WHERE id=?').bind(accepted?'accepted':'declined',id).run();
+        await env.DB.prepare('UPDATE game_invites SET status=? WHERE id=?').bind(accepted?'accepted':'declined',id).run(); await notify(env.DB,env,inv.from_user_id,accepted?'game_invite_accepted':'game_invite_declined',accepted?'Oyun daveti kabul edildi':'Oyun daveti reddedildi',accepted?`${user.display_name} oyun davetini kabul etti.`:`${user.display_name} oyun davetini reddetti.`,{inviteId:id,roomCode:accepted?inv.room_code:null});
         return json({ok:true,status:accepted?'accepted':'declined',roomCode:accepted?inv.room_code:null});
       } catch { return json({error:'Davet yanıtlanamadı.'},{status:400}); }
     }
@@ -202,16 +931,76 @@ export default {
       if (!ROOM_CODE_RE.test(code)) return json({type:'room:error',message:'Geçersiz oda kodu.'},{status:400});
       const user=await authUser(request,env); if(!user)return json({error:'Online oyun için giriş yapmalısınız.'},{status:401});
       const forwarded=new Request(request,{headers:new Headers(request.headers)}); forwarded.headers.set('x-zato-user-id',user.id); forwarded.headers.set('x-zato-username',user.username); forwarded.headers.set('x-zato-display-name',user.display_name); forwarded.headers.set('x-zato-rating',String(user.rating));
+      if(env.DB){ const tm=await env.DB.prepare(`SELECT t.time_control,t.status,m.player1_id,m.player2_id,m.tiebreak_room_code FROM tournament_matches m JOIN tournaments t ON t.id=m.tournament_id WHERE m.room_code=? OR m.tiebreak_room_code=?`).bind(code,code).first<any>(); if(tm){ const spectator=new URL(request.url).searchParams.get('spectator')==='1'; if(!spectator && tm.status!=='active' && tm.status!=='live')return json({type:'room:error',message:'Bu turnuva odası yalnızca aktif eşleşmeye açıktır.'},{status:403}); if(!spectator && user.id!==tm.player1_id && user.id!==tm.player2_id)return json({type:'room:error',message:'Bu turnuva maçında oyuncu değilsiniz.'},{status:403}); if(spectator)forwarded.headers.set('x-zato-spectator','1'); const u=new URL(forwarded.url); u.searchParams.set('timeControl',tm.time_control); return env.ROOMS.get(env.ROOMS.idFromName(code)).fetch(new Request(u,forwarded)); } }
       return env.ROOMS.get(env.ROOMS.idFromName(code)).fetch(forwarded);
     }
     return new Response('ZATO Chess Worker',{headers:{'content-type':'text/plain; charset=utf-8'}});
   }
 };
 
+export class MatchmakingDurableObject {
+  private state:DurableObjectState; private env:Env;
+  constructor(state:DurableObjectState,env:Env){this.state=state;this.env=env;}
+  async fetch(request:Request):Promise<Response>{
+    if(!this.env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503});
+    const url=new URL(request.url); const body=request.method==='POST'?await request.json().catch(()=>({})):{} as any; const userId=String((body as any).userId||url.searchParams.get('userId')||'');
+    if(!userId)return json({error:'Kullanıcı gerekli.'},{status:400});
+    await this.env.DB.batch([this.env.DB.prepare(`UPDATE matchmaking_queue SET status='expired' WHERE status='waiting' AND created_at<=?`).bind(new Date(Date.now()-10*60*1000).toISOString()),this.env.DB.prepare(`UPDATE matchmaking_queue SET status='expired' WHERE status='matched' AND matched_at<=?`).bind(new Date(Date.now()-2*60*1000).toISOString())]);
+    if(url.pathname==='/leave' && request.method==='POST'){await this.env.DB.prepare(`UPDATE matchmaking_queue SET status='cancelled' WHERE user_id=? AND status='waiting'`).bind(userId).run();return json({ok:true,status:'idle'});}
+    if(url.pathname==='/status' && request.method==='GET'){
+      const row=await this.env.DB.prepare(`SELECT id,status,time_control,rating,created_at,matched_at,room_code,opponent_user_id,opponent_rating,arena_id FROM matchmaking_queue WHERE user_id=? AND status IN ('waiting','matched') ORDER BY created_at DESC LIMIT 1`).bind(userId).first<any>();
+      return json(row?{status:row.status,queueId:row.id,timeControl:row.time_control,arenaId:row.arena_id||null,rating:Number(row.rating),createdAt:row.created_at,matchedAt:row.matched_at,roomCode:row.room_code,opponentUserId:row.opponent_user_id,opponentRating:row.opponent_rating!=null?Number(row.opponent_rating):null}:{status:'idle'});
+    }
+    if(url.pathname==='/join' && request.method==='POST'){
+      const timeControl=String((body as any).timeControl||'10+0'); const arenaId=(body as any).arenaId?String((body as any).arenaId):null; const rating=Number((body as any).rating||1200); const config=TIME_CONTROLS[timeControl]; if(!config)return json({error:'Desteklenmeyen süre kontrolü.'},{status:400});
+      const existing=await this.env.DB.prepare(`SELECT id,status,time_control,room_code,opponent_user_id,opponent_rating,arena_id FROM matchmaking_queue WHERE user_id=? AND status IN ('waiting','matched') ORDER BY created_at DESC LIMIT 1`).bind(userId).first<any>();
+      if(existing){ if(existing.status==='matched')return json({status:'matched',matched:true,match:{roomCode:existing.room_code,timeControl:existing.time_control,arenaId:existing.arena_id||null,opponentUserId:existing.opponent_user_id,opponentRating:Number(existing.opponent_rating||0)}}); return json({status:'waiting',queueId:existing.id,timeControl:existing.time_control,arenaId:existing.arena_id||null}); }
+      const id=crypto.randomUUID(); const createdAt=new Date().toISOString(); await this.env.DB.prepare(`INSERT INTO matchmaking_queue(id,user_id,rating,time_control,status,created_at,arena_id) VALUES(?,?,?,?, 'waiting',?,?)`).bind(id,userId,rating,timeControl,createdAt,arenaId).run();
+      const ageMs=Math.max(0,Date.now()-new Date(createdAt).getTime()); const range=Math.min(400,100+Math.floor(ageMs/15000)*50);
+      const candidate=await this.env.DB.prepare(`SELECT id,user_id,rating,time_control,created_at,arena_id FROM matchmaking_queue WHERE status='waiting' AND time_control=? AND user_id<>? AND ((arena_id IS NULL AND ? IS NULL) OR arena_id=?) AND ABS(rating-?)<=MAX(?,MIN(400,100+CAST((julianday('now')-julianday(created_at))*86400/15 AS INTEGER)*50)) ORDER BY ABS(rating-?) ASC,created_at ASC LIMIT 1`).bind(timeControl,userId,arenaId,arenaId,rating,range,rating).first<any>();
+      if(!candidate)return json({status:'waiting',queueId:id,timeControl});
+      const roomCode=crypto.randomUUID().replaceAll('-','').slice(0,6).toUpperCase(); const matchedAt=new Date().toISOString();
+      await this.env.DB.batch([
+        this.env.DB.prepare(`UPDATE matchmaking_queue SET status='matched',matched_at=?,room_code=?,opponent_user_id=?,opponent_rating=? WHERE id=? AND status='waiting'`).bind(matchedAt,roomCode,userId,rating,candidate.id),
+        this.env.DB.prepare(`UPDATE matchmaking_queue SET status='matched',matched_at=?,room_code=?,opponent_user_id=?,opponent_rating=? WHERE id=? AND status='waiting'`).bind(matchedAt,roomCode,userId,rating,id)
+      ]);
+      const verify=await this.env.DB.prepare(`SELECT status,room_code,opponent_user_id,opponent_rating,time_control,arena_id FROM matchmaking_queue WHERE id=?`).bind(id).first<any>();
+      if(!verify || verify.status!=='matched')return json({status:'waiting',queueId:id,timeControl});
+      return json({status:'matched',matched:true,match:{roomCode:verify.room_code,timeControl:verify.time_control,arenaId:verify.arena_id||null,opponentUserId:verify.opponent_user_id,opponentRating:Number(verify.opponent_rating||0)}});
+    }
+    return json({error:'Geçersiz matchmaking işlemi.'},{status:404});
+  }
+}
+
+export class SocialDurableObject {
+  private state:DurableObjectState;
+  private sockets=new Set<WebSocket>();
+  private userId='';
+  constructor(state:DurableObjectState){this.state=state;}
+  async fetch(request:Request):Promise<Response>{
+    if(request.method==='POST' && new URL(request.url).pathname==='/push'){
+      const target=request.headers.get('x-zato-user-id')||'';
+      if(!target || (this.userId && target!==this.userId)) return new Response('Forbidden',{status:403});
+      let payload:any; try{payload=await request.json();}catch{return new Response('Bad Request',{status:400});}
+      const data=JSON.stringify(payload);
+      for(const socket of this.sockets){try{socket.send(data);}catch{this.sockets.delete(socket);}}
+      return new Response('ok');
+    }
+    if(new URL(request.url).pathname!=='/connect' || request.headers.get('Upgrade')!=='websocket') return new Response('Not found',{status:404});
+    const uid=request.headers.get('x-zato-user-id')||''; if(!uid)return new Response('Unauthorized',{status:401});
+    if(this.userId && this.userId!==uid)return new Response('Forbidden',{status:403}); this.userId=uid;
+    const pair=new WebSocketPair(); const client=pair[0],server=pair[1]; server.accept(); this.sockets.add(server);
+    server.send(JSON.stringify({type:'social:ready',at:Date.now()}));
+    const cleanup=()=>this.sockets.delete(server); server.addEventListener('close',cleanup); server.addEventListener('error',cleanup);
+    return new Response(null,{status:101,webSocket:client});
+  }
+}
+
 export class RoomDurableObject {
   private state:DurableObjectState;
   private env:Env;
   private players = new Map<string,Player>();
+  private spectators = new Map<string,WebSocket>();
   private game = new Chess();
   private history:MoveItem[] = [];
   private whiteMs = INITIAL_MS;
@@ -224,6 +1013,8 @@ export class RoomDurableObject {
   private assignments:Record<string,Color> = {};
   private playerUsers:Record<string,{userId:string;username:string;displayName:string;rating:number}> = {};
   private endedAt:string|null = null;
+  private timeControl = '10+0';
+  private incrementMs = 0;
   private initialized = false;
 
   constructor(state:DurableObjectState, env:Env) { this.state=state; this.env=env; }
@@ -236,7 +1027,7 @@ export class RoomDurableObject {
       this.roomCode=saved.roomCode||this.roomCode; this.gameId=saved.gameId||crypto.randomUUID();
       try { this.game=new Chess(saved.fen); } catch { this.game=new Chess(); }
       this.history=saved.history||[]; this.assignments=saved.assignments||saved.players||{}; this.playerUsers=saved.playerUsers||{}; this.whiteMs=saved.whiteMs??INITIAL_MS; this.blackMs=saved.blackMs??INITIAL_MS;
-      this.turnStartedAt=saved.turnStartedAt??null; this.result=saved.result||'*'; this.startedAt=saved.startedAt||new Date().toISOString(); this.endedAt=saved.endedAt||null;
+      this.turnStartedAt=saved.turnStartedAt??null; this.result=saved.result||'*'; this.startedAt=saved.startedAt||new Date().toISOString(); this.endedAt=saved.endedAt||null; this.timeControl=saved.timeControl||'10+0'; this.incrementMs=Number(saved.incrementMs||TIME_CONTROLS[this.timeControl]?.incrementMs||0); const base=TIME_CONTROLS[this.timeControl]?.baseMs||INITIAL_MS; if(!saved.timeControl){this.whiteMs=base;this.blackMs=base;}
     } else { this.gameId=crypto.randomUUID(); this.startedAt=new Date().toISOString(); }
     this.initialized=true;
   }
@@ -244,10 +1035,16 @@ export class RoomDurableObject {
   async fetch(request:Request):Promise<Response> {
     await this.init(request);
     if (request.headers.get('Upgrade') !== 'websocket') return new Response('WebSocket required',{status:426});
+    const spectator=request.headers.get('x-zato-spectator')==='1';
+    if (spectator) {
+      const pair=new WebSocketPair(); const client=pair[0],server=pair[1]; server.accept(); const sid=crypto.randomUUID(); this.spectators.set(sid,server);
+      server.send(JSON.stringify({type:'room:spectator',gameId:this.gameId,fen:this.game.fen(),turn:this.game.turn(),history:this.history,result:this.result,whiteMs:this.currentClock('w'),blackMs:this.currentClock('b'),members:this.players.size,started:this.players.size===2&&this.result==='*'}));
+      const cleanup=()=>this.spectators.delete(sid); server.addEventListener('close',cleanup); server.addEventListener('error',cleanup); return new Response(null,{status:101,webSocket:client});
+    }
     if (this.players.size>=2) return json({type:'room:error',message:'Oda dolu.'},{status:409});
 
     const url=new URL(request.url);
-    const userId=request.headers.get('x-zato-user-id'); const username=request.headers.get('x-zato-username')||''; const displayName=request.headers.get('x-zato-display-name')||username; const rating=Number(request.headers.get('x-zato-rating')||1200); if(!userId)return json({type:'room:error',message:'Giriş gerekli.'},{status:401}); const requestedId=url.searchParams.get('playerId');
+    const userId=request.headers.get('x-zato-user-id'); const username=request.headers.get('x-zato-username')||''; const displayName=request.headers.get('x-zato-display-name')||username; const rating=Number(request.headers.get('x-zato-rating')||1200); if(!userId)return json({type:'room:error',message:'Giriş gerekli.'},{status:401}); const requestedId=url.searchParams.get('playerId'); const requestedTimeControl=url.searchParams.get('timeControl')||''; if(this.players.size===0 && !this.history.length && requestedTimeControl && TIME_CONTROLS[requestedTimeControl]){this.timeControl=requestedTimeControl;this.incrementMs=TIME_CONTROLS[requestedTimeControl].incrementMs;this.whiteMs=TIME_CONTROLS[requestedTimeControl].baseMs;this.blackMs=TIME_CONTROLS[requestedTimeControl].baseMs;}
     const restoredColor=requestedId ? this.assignments[requestedId] || null : null;
     const id=requestedId && restoredColor ? requestedId : crypto.randomUUID();
     if (this.players.has(id)) return json({type:'room:error',message:'Oyuncu zaten bağlı.'},{status:409});
@@ -259,10 +1056,10 @@ export class RoomDurableObject {
     const pair=new WebSocketPair(); const client=pair[0], server=pair[1]; server.accept();
     this.players.set(id,{id,socket:server,color,userId,username,displayName,rating}); this.playerUsers[id]={userId,username,displayName,rating};
     const started=this.players.size===2 && this.result==='*';
-    if (started && this.turnStartedAt===null) { this.turnStartedAt=Date.now(); await this.armClock(); }
+    if (started && this.turnStartedAt===null) { this.turnStartedAt=Date.now(); await this.armClock(); if(this.env.DB) await this.env.DB.prepare(`UPDATE tournament_matches SET status='live' WHERE room_code=? AND status='ready'`).bind(this.roomCode).run(); }
     await this.persist();
 
-    server.send(JSON.stringify({type:'room:joined',playerId:id,user:{id:userId,username,displayName,rating},color,members:this.players.size,started,fen:this.game.fen(),turn:this.game.turn(),history:this.history,result:this.result,whiteMs:this.currentClock('w'),blackMs:this.currentClock('b'),startedAt:this.startedAt}));
+    server.send(JSON.stringify({type:'room:joined',gameId:this.gameId,playerId:id,user:{id:userId,username,displayName,rating},color,members:this.players.size,started,fen:this.game.fen(),turn:this.game.turn(),history:this.history,result:this.result,whiteMs:this.currentClock('w'),blackMs:this.currentClock('b'),startedAt:this.startedAt}));
     this.broadcast({type:'room:state',members:this.players.size,started,fen:this.game.fen(),turn:this.game.turn(),result:this.result,history:this.history,whiteMs:this.currentClock('w'),blackMs:this.currentClock('b')});
 
     server.addEventListener('message', async e=>{
@@ -278,6 +1075,7 @@ export class RoomDurableObject {
           let move; try { move=this.game.move({from:msg.from,to:msg.to,promotion:msg.promotion||undefined}); } catch { move=null; }
           if (!move) return this.sendError(server,'Geçersiz hamle.');
           this.consumeClock(move.color);
+          if(move.color==='w') this.whiteMs+=this.incrementMs; else this.blackMs+=this.incrementMs;
           const item:MoveItem={from:move.from,to:move.to,promotion:move.promotion,color:move.color,san:move.san,ply:this.history.length+1,fen:this.game.fen(),whiteMs:this.currentClock('w'),blackMs:this.currentClock('b')};
           this.history.push(item); this.result=resultForGame(this.game);
           if (this.result==='*') { this.turnStartedAt=Date.now(); await this.armClock(); }
@@ -322,10 +1120,12 @@ export class RoomDurableObject {
   private async armClock() { if(this.turnStartedAt===null)return; const ms=this.currentClock(this.game.turn()); await this.state.storage.setAlarm(Date.now()+ms+50); }
   private async finishByTime(color:Color,fromPlayer:string) { this.consumeClock(color); this.result=color==='w'?'0-1':'1-0'; this.endedAt=new Date().toISOString(); await this.state.storage.deleteAlarm(); await this.persist(); await this.persistCompletedGame(); this.broadcast({type:'game:over',result:this.result,reason:'timeout',fromPlayer,whiteMs:this.currentClock('w'),blackMs:this.currentClock('b')}); }
   private sendError(socket:WebSocket,message:string){try{socket.send(JSON.stringify({type:'room:error',message}));}catch{}}
-  private async persist(){ await this.state.storage.put<RoomPersisted>('room',{roomCode:this.roomCode,gameId:this.gameId,fen:this.game.fen(),started:this.players.size===2&&this.result==='*',players:Object.fromEntries([...this.players].map(([id,p])=>[id,p.color])),assignments:this.assignments,playerUsers:this.playerUsers,history:this.history,whiteMs:this.whiteMs,blackMs:this.blackMs,turnStartedAt:this.turnStartedAt,result:this.result,startedAt:this.startedAt,endedAt:this.endedAt}); }
-  private async persistCompletedGame(){ if(!this.env.DB||this.result==='*')return; try { const vals=Object.values(this.playerUsers); const whiteId=Object.entries(this.assignments).find(([,c])=>c==='w')?.[0]; const blackId=Object.entries(this.assignments).find(([,c])=>c==='b')?.[0]; const wu=whiteId?this.playerUsers[whiteId]:null; const bu=blackId?this.playerUsers[blackId]:null; await this.env.DB.prepare(`INSERT OR REPLACE INTO games (id,white_user_id,black_user_id,white_name,black_name,time_control,result,status,pgn,initial_fen,final_fen,started_at,ended_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(this.gameId,wu?.userId||null,bu?.userId||null,wu?.displayName||'ZATO White',bu?.displayName||'ZATO Black','10+0',this.result,'finished',this.game.pgn({maxWidth:80,newline:'\n'}),'startpos',this.game.fen(),this.startedAt,this.endedAt||new Date().toISOString()).run(); for(const m of this.history){ await this.env.DB.prepare(`INSERT OR REPLACE INTO moves (game_id,ply,san,uci,fen_after,clock_white,clock_black) VALUES (?,?,?,?,?,?,?)`).bind(this.gameId,m.ply,m.san,`${m.from}${m.to}${m.promotion||''}`,m.fen,m.whiteMs,m.blackMs).run(); }
-      if(wu&&bu){ const scoreW=this.result==='1-0'?1:this.result==='1/2-1/2'?0.5:0; const nw=elo(wu.rating,bu.rating,scoreW), nb=elo(bu.rating,wu.rating,1-scoreW); await this.env.DB.batch([this.env.DB.prepare(`UPDATE users SET rating=?,games_played=games_played+1,wins=wins+?,draws=draws+?,losses=losses+? WHERE id=?`).bind(nw,scoreW===1?1:0,scoreW===0.5?1:0,scoreW===0?1:0,wu.userId),this.env.DB.prepare(`UPDATE users SET rating=?,games_played=games_played+1,wins=wins+?,draws=draws+?,losses=losses+? WHERE id=?`).bind(nb,scoreW===0?1:0,scoreW===0.5?1:0,scoreW===1?1:0,bu.userId)]); }
+  private async persist(){ await this.state.storage.put<RoomPersisted>('room',{roomCode:this.roomCode,gameId:this.gameId,fen:this.game.fen(),started:this.players.size===2&&this.result==='*',players:Object.fromEntries([...this.players].map(([id,p])=>[id,p.color])),assignments:this.assignments,playerUsers:this.playerUsers,history:this.history,whiteMs:this.whiteMs,blackMs:this.blackMs,turnStartedAt:this.turnStartedAt,result:this.result,startedAt:this.startedAt,endedAt:this.endedAt,timeControl:this.timeControl,incrementMs:this.incrementMs}); }
+  private async persistCompletedGame(){ if(!this.env.DB||this.result==='*')return; try { const vals=Object.values(this.playerUsers); const whiteId=Object.entries(this.assignments).find(([,c])=>c==='w')?.[0]; const blackId=Object.entries(this.assignments).find(([,c])=>c==='b')?.[0]; const wu=whiteId?this.playerUsers[whiteId]:null; const bu=blackId?this.playerUsers[blackId]:null; await this.env.DB.prepare(`INSERT OR REPLACE INTO games (id,white_user_id,black_user_id,white_name,black_name,time_control,result,status,pgn,initial_fen,final_fen,started_at,ended_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(this.gameId,wu?.userId||null,bu?.userId||null,wu?.displayName||'ZATO White',bu?.displayName||'ZATO Black',this.timeControl,this.result,'finished',this.game.pgn({maxWidth:80,newline:'\n'}),'startpos',this.game.fen(),this.startedAt,this.endedAt||new Date().toISOString()).run(); await this.env.DB.prepare(`UPDATE tournament_matches SET game_id=? WHERE room_code=? AND status IN ('ready','live')`).bind(this.gameId,this.roomCode).run(); await this.env.DB.prepare(`UPDATE tournament_matches SET tiebreak_game_id=? WHERE tiebreak_room_code=? AND status='live'`).bind(this.gameId,this.roomCode).run(); await tournamentAfterGame(this.env.DB,this.env,this.gameId,this.result,this.endedAt?new Date(this.endedAt):new Date()); const tournamentMatch=await this.env.DB.prepare(`SELECT tiebreak_game_id FROM tournament_matches WHERE tiebreak_game_id=? LIMIT 1`).bind(this.gameId).first<any>(); const isTournamentTiebreak=Boolean(tournamentMatch); const already=await this.env.DB.prepare(`SELECT 1 FROM game_results_notified WHERE game_id=?`).bind(this.gameId).first(); if(!already && wu&&bu){ const winner=this.result==='1-0'?wu:this.result==='0-1'?bu:null; const label=this.result==='1/2-1/2'?'Berabere':winner?`${winner.displayName} kazandı`:'Maç sona erdi'; await notify(this.env.DB,this.env,wu.userId,'game_result','Maç sonucu',`Maç tamamlandı: ${label}.`,{gameId:this.gameId,result:this.result,opponentUserId:bu.userId}); await notify(this.env.DB,this.env,bu.userId,'game_result','Maç sonucu',`Maç tamamlandı: ${label}.`,{gameId:this.gameId,result:this.result,opponentUserId:wu.userId}); await this.env.DB.prepare(`INSERT INTO game_results_notified(game_id) VALUES(?)`).bind(this.gameId).run(); } for(const m of this.history){ await this.env.DB.prepare(`INSERT OR REPLACE INTO moves (game_id,ply,san,uci,fen_after,clock_white,clock_black) VALUES (?,?,?,?,?,?,?)`).bind(this.gameId,m.ply,m.san,`${m.from}${m.to}${m.promotion||''}`,m.fen,m.whiteMs,m.blackMs).run(); }
+      if(wu&&bu&&!isTournamentTiebreak){ const scoreW=this.result==='1-0'?1:this.result==='1/2-1/2'?0.5:0; const nw=elo(wu.rating,bu.rating,scoreW), nb=elo(bu.rating,wu.rating,1-scoreW); await this.env.DB.batch([this.env.DB.prepare(`UPDATE users SET rating=?,games_played=games_played+1,wins=wins+?,draws=draws+?,losses=losses+? WHERE id=?`).bind(nw,scoreW===1?1:0,scoreW===0.5?1:0,scoreW===0?1:0,wu.userId),this.env.DB.prepare(`UPDATE users SET rating=?,games_played=games_played+1,wins=wins+?,draws=draws+?,losses=losses+? WHERE id=?`).bind(nb,scoreW===0?1:0,scoreW===0.5?1:0,scoreW===1?1:0,bu.userId)]); await this.env.DB.batch([this.env.DB.prepare(`INSERT INTO rating_history(id,user_id,game_id,old_rating,new_rating,delta) VALUES(?,?,?,?,?,?)`).bind(crypto.randomUUID(),wu.userId,this.gameId,wu.rating,nw,nw-wu.rating),this.env.DB.prepare(`INSERT INTO rating_history(id,user_id,game_id,old_rating,new_rating,delta) VALUES(?,?,?,?,?,?)`).bind(crypto.randomUUID(),bu.userId,this.gameId,bu.rating,nb,nb-bu.rating)]); const season=seasonInfo(this.endedAt?new Date(this.endedAt):new Date()); const wWin=scoreW===1?1:0,wDraw=scoreW===0.5?1:0,wLoss=scoreW===0?1:0,bWin=scoreW===0?1:0,bDraw=scoreW===0.5?1:0,bLoss=scoreW===1?1:0; await this.env.DB.batch([this.env.DB.prepare(`INSERT INTO season_player_stats(season_id,user_id,games,wins,draws,losses,start_rating,current_rating,peak_rating,rating_delta,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(season_id,user_id) DO UPDATE SET games=games+1,wins=wins+?,draws=draws+?,losses=losses+?,current_rating=?,peak_rating=MAX(peak_rating,?),rating_delta=rating_delta+?,updated_at=CURRENT_TIMESTAMP`).bind(season.id,wu.userId,1,wWin,wDraw,wLoss,wu.rating,nw,nw,nw-wu.rating,wWin,wDraw,wLoss,nw, nw, nw-wu.rating),this.env.DB.prepare(`INSERT INTO season_player_stats(season_id,user_id,games,wins,draws,losses,start_rating,current_rating,peak_rating,rating_delta,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(season_id,user_id) DO UPDATE SET games=games+1,wins=wins+?,draws=draws+?,losses=losses+?,current_rating=?,peak_rating=MAX(peak_rating,?),rating_delta=rating_delta+?,updated_at=CURRENT_TIMESTAMP`).bind(season.id,bu.userId,1,bWin,bDraw,bLoss,bu.rating,nb,nb,nb-bu.rating,bWin,bDraw,bLoss,nb,nb,nb-bu.rating)]); }
     } catch(e){ await this.state.storage.put('d1_error',String(e)); } }
-  private broadcast(message:unknown){const data=JSON.stringify(message);for(const {socket} of this.players.values()){try{socket.send(data);}catch{}}}
+  private broadcast(message:unknown){const data=JSON.stringify(message);for(const {socket} of this.players.values()){try{socket.send(data);}catch{}}for(const socket of this.spectators.values()){try{socket.send(data);}catch{}}}
   private broadcastExcept(excludeId:string,message:unknown){const data=JSON.stringify(message);for(const [id,{socket}] of this.players){if(id!==excludeId)try{socket.send(data);}catch{}}}
-}
+}async function hmacSha256Hex(secret:string,input:string){const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(secret),{name:'HMAC',hash:'SHA-256'},false,['sign']);const sig=await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(input));return Array.from(new Uint8Array(sig)).map(x=>x.toString(16).padStart(2,'0')).join('');}
+async function hmacSha256Verify(secret:string,input:string,expected:string){const actual=await hmacSha256Hex(secret,input);return actual===expected;}
+

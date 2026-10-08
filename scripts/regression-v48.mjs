@@ -1,0 +1,17 @@
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const root = new URL('..', import.meta.url).pathname;
+const worker=fs.readFileSync(root+'worker/index.ts','utf8');
+const app=fs.readFileSync(root+'src/App.tsx','utf8');
+const pkg=JSON.parse(fs.readFileSync(root+'package.json','utf8'));
+const ctx=fs.readFileSync(root+'ZATO_PROJECT_CONTEXT.md','utf8');
+assert.equal(pkg.version,'48.0.0');
+assert.match(worker,/version:'48\.0\.0'/);
+assert.match(worker,/const comparisons=/);
+assert.match(worker,/const share=/);
+assert.match(app,/shareTournament/);
+assert.match(app,/tournament-headtohead/);
+assert.match(app,/Özeti paylaş/);
+assert.match(ctx,/V48/);
+assert.match(ctx,/Sonraki mantıklı adım/);
+console.log('V48 regression OK');

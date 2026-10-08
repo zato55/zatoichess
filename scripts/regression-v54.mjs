@@ -1,0 +1,18 @@
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const worker=fs.readFileSync('worker/index.ts','utf8');
+const pkg=JSON.parse(fs.readFileSync('package.json','utf8'));
+const migration=fs.readFileSync('db/migrations/V54.sql','utf8');
+assert.equal(pkg.version,'54.0.0');
+assert.match(worker,/blocked_hits/);
+assert.match(worker,/last_blocked_at/);
+assert.match(worker,/tournamentShareHealth/);
+assert.match(worker,/cache-aware/gi);
+assert.match(worker,/response\.status===200/);
+assert.match(worker,/v54:'share-abuse-telemetry-cache-aware-accounting-and-route-health'/);
+assert.match(worker,/e\.key==='ArrowLeft'/);
+assert.match(worker,/e\.key==='ArrowRight'/);
+assert.match(worker,/e\.key===' '/);
+assert.match(migration,/CREATE TABLE IF NOT EXISTS tournament_share_abuse_windows/);
+assert.match(migration,/idx_tournament_share_abuse_window/);
+const routeMarkers=['publicShareMatch','publicReplayMatch','publicOgMatch','publicSharePage','tournamentShareStats','tournamentShareHealth','tournamentShareMatch']; for(const marker of routeMarkers) assert.match(worker,new RegExp('const '+marker)); console.log('V54 regression OK');

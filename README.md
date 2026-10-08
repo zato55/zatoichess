@@ -1,3 +1,9 @@
+# ZATO Chess V19
+
+V19 adds the social game-invite interface on top of the V18 backend: friends, incoming friend requests, player search, direct game invites, 10-minute invite lifecycle, and automatic private-room connection after accepting an invite.
+
+The existing Durable Object online chess flow and D1 `game_invites` backend remain the source of truth.
+
 # ZATO Chess V11
 
 ZATO Chess now includes the V10 authoritative online core plus the first real account layer.
@@ -48,3 +54,6 @@ Playable puzzle mode uses server-selected puzzles, validates solution moves in t
 
 ## V18
 Daily puzzle, persistent puzzle rating, streaks, attempt statistics, and deterministic daily puzzle selection are included.
+
+## V41
+Arena anti-abuse audit/cooldown, daily/weekly Cup sistemi, Cup rewards/history ve dependency-free regression tooling eklendi. Devam bağlamı için `ZATO_PROJECT_CONTEXT.md` okunmalıdır.

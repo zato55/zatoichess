@@ -1,1 +1,52 @@
-{"name":"zato-chess","private":true,"version":"18.0.0","type":"module","scripts":{"dev":"vite","build":"tsc -b --pretty false && tsc -p worker/tsconfig.json --pretty false && vite build","check":"tsc -b --pretty false && tsc -p worker/tsconfig.json --pretty false","postinstall":"node scripts/copy-stockfish.mjs","predev":"node scripts/copy-stockfish.mjs","prebuild":"node scripts/copy-stockfish.mjs"},"dependencies":{"@vitejs/plugin-react":"latest","chess.js":"latest","vite":"latest","typescript":"latest","react":"latest","react-dom":"latest","stockfish":"^19.0.0"},"devDependencies":{"@cloudflare/workers-types":"latest"}}
+{
+  "name": "zato-chess",
+  "private": true,
+  "version": "66.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b --pretty false && tsc -p worker/tsconfig.json --pretty false && vite build",
+    "check": "tsc -b --pretty false && tsc -p worker/tsconfig.json --pretty false",
+    "postinstall": "node scripts/copy-stockfish.mjs",
+    "predev": "node scripts/copy-stockfish.mjs",
+    "prebuild": "node scripts/copy-stockfish.mjs",
+    "regression": "node scripts/regression-v44.mjs",
+    "regression:v46": "node scripts/regression-v46.mjs",
+    "regression:v45": "node scripts/regression-v45.mjs",
+    "regression:v47": "node scripts/regression-v47.mjs",
+    "regression:v48": "node scripts/regression-v48.mjs",
+    "regression:v49": "node scripts/regression-v49.mjs",
+    "regression:v50": "node scripts/regression-v50.mjs",
+    "regression:v51": "node scripts/regression-v51.mjs",
+    "regression:v53": "node scripts/regression-v53.mjs",
+    "regression:v54": "node scripts/regression-v54.mjs",
+    "regression:v55": "node scripts/regression-v55.mjs",
+    "regression:v56": "node scripts/regression-v56.mjs",
+    "regression:v57": "node scripts/regression-v57.mjs",
+    "regression:v58": "node scripts/regression-v58.mjs",
+    "regression:v59": "node scripts/regression-v59.mjs",
+    "regression:v60": "node scripts/regression-v60.mjs",
+    "regression:v61": "node scripts/regression-v61.mjs",
+    "regression:v62": "node scripts/regression-v62.mjs",
+    "regression:v63": "node scripts/regression-v63.mjs",
+    "regression:v64": "node scripts/regression-v64.mjs",
+    "regression:v65": "node scripts/regression-v65.mjs",
+    "test:signature-rotation:v65": "node scripts/signature-rotation-v65.mjs",
+    "test:route-contract:v65": "node scripts/route-contract-v65.mjs",
+    "regression:v66": "node scripts/regression-v66.mjs",
+    "test:runtime-contract:v66": "node scripts/runtime-contract-v66.mjs",
+    "test:key-rotation:v66": "node scripts/key-rotation-v66.mjs"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "chess.js": "latest",
+    "vite": "latest",
+    "typescript": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "stockfish": "^19.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "latest"
+  }
+}

@@ -1,0 +1,8 @@
+CREATE TABLE IF NOT EXISTS tournament_share_retention_remediation_audit (id TEXT PRIMARY KEY,tournament_id TEXT,remediation_id TEXT,action TEXT,previous_status TEXT,next_status TEXT,previous_hash TEXT,entry_hash TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tournament_share_retention_remediation_exports (id TEXT PRIMARY KEY,tournament_id TEXT,export_version TEXT,row_count INTEGER NOT NULL DEFAULT 0,integrity_sha256 TEXT,signature TEXT,key_id TEXT,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tournament_share_cleanup_comparison_drilldown (id TEXT PRIMARY KEY,tournament_id TEXT,comparison_id TEXT,route TEXT,left_value INTEGER NOT NULL DEFAULT 0,right_value INTEGER NOT NULL DEFAULT 0,delta INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tournament_share_retention_policy_enforcement (id TEXT PRIMARY KEY,tournament_id TEXT,policy_version TEXT,status TEXT,candidate_count INTEGER NOT NULL DEFAULT 0,blocked_count INTEGER NOT NULL DEFAULT 0,action TEXT,detail TEXT,created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_tournament_share_remediation_audit_tournament ON tournament_share_retention_remediation_audit(tournament_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tournament_share_remediation_exports_tournament ON tournament_share_retention_remediation_exports(tournament_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tournament_share_cleanup_drilldown_comparison ON tournament_share_cleanup_comparison_drilldown(comparison_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tournament_share_policy_enforcement_tournament ON tournament_share_retention_policy_enforcement(tournament_id,created_at DESC);

@@ -490,8 +490,6 @@ CREATE INDEX IF NOT EXISTS idx_tournament_shares_token ON tournament_shares(toke
 
 
 -- ===== db/migrations/001_auth.sql =====
-ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT '';
-ALTER TABLE users ADD COLUMN password_salt TEXT NOT NULL DEFAULT '';
 
 
 -- ===== db/migrations/002_analysis.sql =====
@@ -501,7 +499,6 @@ CREATE INDEX IF NOT EXISTS idx_analysis_game_engine ON analyses(game_id, engine,
 -- ===== db/migrations/V31.sql =====
 -- ZATO Chess V31 migration
 -- Adds persisted Stockfish centipawn loss so ACPL/accuracy can be calculated server-side.
-ALTER TABLE analyses ADD COLUMN loss_cp INTEGER DEFAULT 0;
 
 
 -- ===== db/migrations/V32.sql =====
@@ -596,7 +593,6 @@ CREATE INDEX IF NOT EXISTS idx_matchmaking_user_status ON matchmaking_queue(user
 
 -- ===== db/migrations/V38.sql =====
 -- V38 arena live scoring
-ALTER TABLE matchmaking_queue ADD COLUMN arena_id TEXT;
 CREATE TABLE IF NOT EXISTS arena_events (id TEXT PRIMARY KEY,label TEXT NOT NULL,time_control TEXT NOT NULL,starts_at TEXT NOT NULL,ends_at TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,CHECK(status IN ('active','finished')));
 CREATE TABLE IF NOT EXISTS arena_participants (arena_id TEXT NOT NULL,user_id TEXT NOT NULL,joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,left_at TEXT,PRIMARY KEY(arena_id,user_id),FOREIGN KEY(arena_id) REFERENCES arena_events(id) ON DELETE CASCADE,FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE);
 CREATE INDEX IF NOT EXISTS idx_arena_events_active ON arena_events(status,ends_at,time_control);
@@ -749,17 +745,11 @@ CREATE INDEX IF NOT EXISTS idx_tournament_rewards_user ON tournament_rewards(use
 
 -- ===== db/migrations/V43.sql =====
 -- V43 tournament hardening: explicit draw tie-break + tournament notifications
-ALTER TABLE tournament_matches ADD COLUMN tie_break TEXT NOT NULL DEFAULT 'none';
-ALTER TABLE tournament_matches ADD COLUMN winner_reason TEXT NOT NULL DEFAULT 'game_result';
-ALTER TABLE notification_preferences ADD COLUMN tournament_update INTEGER NOT NULL DEFAULT 1;
 CREATE INDEX IF NOT EXISTS idx_tournament_matches_status ON tournament_matches(tournament_id,status,round,match_no);
 
 
 -- ===== db/migrations/V44.sql =====
 -- V44 tournament quality expansion: replay tie-breaks + history
-ALTER TABLE tournaments ADD COLUMN tiebreak_mode TEXT NOT NULL DEFAULT 'seed';
-ALTER TABLE tournament_matches ADD COLUMN tiebreak_game_id TEXT;
-ALTER TABLE tournament_matches ADD COLUMN tiebreak_room_code TEXT;
 CREATE INDEX IF NOT EXISTS idx_tournament_matches_tiebreak_game ON tournament_matches(tiebreak_game_id);
 CREATE INDEX IF NOT EXISTS idx_tournament_matches_tiebreak_room ON tournament_matches(tiebreak_room_code);
 CREATE INDEX IF NOT EXISTS idx_tournaments_finished_ends ON tournaments(status,ends_at DESC);
@@ -781,7 +771,6 @@ CREATE INDEX IF NOT EXISTS idx_tournament_matches_players ON tournament_matches(
 
 -- ===== db/migrations/V47.sql =====
 -- V47: tournament round analytics, entry-rating snapshots, replay/review history indexes
-ALTER TABLE tournament_players ADD COLUMN rating_at_entry INTEGER;
 UPDATE tournament_players
 SET rating_at_entry = COALESCE(rating_at_entry, (SELECT rating FROM users WHERE users.id=tournament_players.user_id));
 
@@ -808,15 +797,11 @@ CREATE INDEX IF NOT EXISTS idx_tournament_shares_token ON tournament_shares(toke
 
 -- ===== db/migrations/V50.sql =====
 -- V50 public share analytics
-ALTER TABLE tournament_shares ADD COLUMN views_count INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE tournament_shares ADD COLUMN last_viewed_at TEXT;
 CREATE INDEX IF NOT EXISTS idx_tournament_shares_views ON tournament_shares(views_count DESC);
 
 
 -- ===== db/migrations/V51.sql =====
 -- V51 share security + privacy controls
-ALTER TABLE tournament_shares ADD COLUMN expires_at TEXT;
-ALTER TABLE tournament_shares ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public';
 UPDATE tournament_shares SET expires_at=datetime(created_at,'+30 days') WHERE expires_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_tournament_shares_active ON tournament_shares(tournament_id,revoked_at,expires_at);
 

@@ -1,0 +1,17 @@
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const pkg=JSON.parse(fs.readFileSync('package.json','utf8'));
+const worker=fs.readFileSync('worker/index.ts','utf8');
+const mig=fs.readFileSync('db/migrations/V69.sql','utf8');
+assert.equal(pkg.version,'69.0.0');
+assert.match(pkg.scripts['regression:v69'],/regression-v69/);
+assert.match(mig,/tournament_share_evidence_retention/);
+assert.match(mig,/evidence_days/);
+assert.ok(worker.includes('contract-evidence\\/verify')); 
+assert.ok(worker.includes('keys\\/chain\\/verify')); 
+assert.match(worker,/summarizeContractReplay/);
+assert.match(worker,/verifyKeyAuditChain/);
+assert.ok(worker.includes('share\\/health\\/retention')); 
+assert.match(worker,/version:'69\.0\.0'/);
+assert.match(worker,/v69:'contract-evidence-verification-key-chain-integrity-evidence-retention'/);
+console.log('V69 regression OK');

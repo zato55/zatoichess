@@ -1,0 +1,16 @@
+import fs from 'node:fs';
+import path from 'node:path';
+const root=process.cwd();
+const read=p=>fs.readFileSync(path.join(root,p),'utf8');
+const pkg=JSON.parse(read('package.json'));
+if(pkg.version!=='83.0.0') throw new Error('version 83 bekleniyor');
+const mig=read('db/migrations/V83.sql');
+for(const t of ['tournament_share_retention_remediation_export_verifications','tournament_share_cleanup_drilldown_snapshots','tournament_share_retention_policy_incidents','tournament_share_scheduled_retention_replays']) if(!mig.includes(`CREATE TABLE IF NOT EXISTS ${t}`)) throw new Error(`V83 tablo eksik: ${t}`);
+const worker=read('worker/index.ts');
+for(const x of ['tournamentShareV83RemediationVerify','tournamentShareV83RemediationVerifyHistory','tournamentShareV83CleanupSnapshot','tournamentShareV83PolicyIncident','tournamentShareV83ScheduledReplay','runScheduledRetentionReplay']) if(!worker.includes(x)) throw new Error(`V83 worker eksik: ${x}`);
+if(!worker.includes("version:'83.0.0'")) throw new Error('V83 readiness version eksik');
+if(!worker.includes("v83:'remediation-export-verification-history-cleanup-drilldown-snapshots-policy-incidents-scheduled-retention-replay'")) throw new Error('V83 readiness marker eksik');
+const app=read('src/App.tsx');
+for(const x of ['loadTournamentShareV83','verifyTournamentShareV83Remediation','runTournamentShareV83Replay','snapshotTournamentShareV83Drill','updateTournamentShareV83Incident','share-v83-ops']) if(!app.includes(x)) throw new Error(`V83 UI eksik: ${x}`);
+for(const f of ['docs/releases/V83_RELEASE_NOTES.md','docs/releases/V83_PRODUCTION_CHECKLIST.md','docs/continuation/ZATO_PROJECT_CONTEXT.md','docs/continuation/ARCHITECTURE.md','docs/continuation/CURRENT_STATE.md','docs/continuation/NEXT_STEPS.md']) if(!fs.existsSync(path.join(root,f))) throw new Error(`devir dokümanı eksik: ${f}`);
+console.log('V83 regression OK');

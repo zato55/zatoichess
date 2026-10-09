@@ -1,0 +1,19 @@
+node_modules/
+dist/
+build/
+.wrangler/
+.dev.vars
+.env
+.env.*
+*.tsbuildinfo
+*.log
+
+# Local backup files
+backup-online-names-*/
+*.bak
+*.before-fix
+*.before-my-fix
+*.before-reconnect
+*.orphan-backup
+*.wsfix-backup
+wrangler.toml.backup

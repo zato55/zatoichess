@@ -1,0 +1,9 @@
+{
+  "version": "66",
+  "contracts": [
+    {"name":"public-tournament-json","method":"GET","path":"/api/public/tournaments/:token","fresh":{"status":200,"cache":"origin-miss"},"conditional":{"status":304,"cache":"conditional-hit"}},
+    {"name":"public-replay-json","method":"GET","path":"/api/public/tournaments/:token/replay/:match","fresh":{"status":200,"cache":"origin-miss"},"conditional":{"status":304,"cache":"conditional-hit"}},
+    {"name":"public-og-image","method":"GET","path":"/share/tournament/:token/og.svg","fresh":{"status":200,"cache":"origin-miss"},"conditional":{"status":304,"cache":"conditional-hit"}},
+    {"name":"public-html","method":"GET","path":"/share/tournament/:token","fresh":{"status":200,"cache":"origin-miss"},"conditional":{"status":304,"cache":"conditional-hit"}}
+  ]
+}

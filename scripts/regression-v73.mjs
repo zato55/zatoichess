@@ -1,0 +1,10 @@
+import fs from 'node:fs';
+const pkg=JSON.parse(fs.readFileSync(new URL('../package.json',import.meta.url)));
+if(pkg.version!=='73.0.0') throw new Error('version');
+const w=fs.readFileSync(new URL('../worker/index.ts',import.meta.url),'utf8');
+const m=fs.readFileSync(new URL('../db/migrations/V73.sql',import.meta.url),'utf8');
+for(const x of ['tournament_share_contract_matrix_snapshots','tournament_share_retention_error_actions']) if(!m.includes(x)) throw new Error('migration '+x);
+for(const x of ['tournamentShareIncidentAuditExport','tournamentShareRetentionErrorAction','tournamentShareReplayBundle','tournament_share_contract_matrix_snapshots']) if(!w.includes(x)) throw new Error('route '+x);
+if(!w.includes("version:'73.0.0'")) throw new Error('readiness version');
+if(!w.includes("v73:'versioned-contract-matrix-snapshots-incident-integrity-retention-error-lifecycle-deterministic-replay-bundle'")) throw new Error('marker');
+console.log('V73 regression OK');

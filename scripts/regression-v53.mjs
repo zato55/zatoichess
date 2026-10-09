@@ -1,0 +1,15 @@
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const worker=fs.readFileSync('worker/index.ts','utf8');
+const app=fs.readFileSync('src/App.tsx','utf8');
+const pkg=JSON.parse(fs.readFileSync('package.json','utf8'));
+assert.equal(pkg.version,'53.0.0');
+assert.match(worker,/async function cachedJson\(request:Request,data:unknown,maxAge=60\)/);
+assert.match(worker,/if\(request\.headers\.get\('if-none-match'\)===etag\) return new Response\(null/);
+assert.match(worker,/cache-control.*must-revalidate/);
+assert.match(worker,/v53:'public-share-cache-etag-analytics-and-replay-controls'/);
+assert.match(worker,/svgEtag/);
+assert.match(app,/Public paylaşım analitiği/);
+assert.match(app,/14 günlük/);
+assert.match(app,/Son ziyaret/);
+console.log('V53 regression OK');

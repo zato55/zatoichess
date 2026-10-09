@@ -1,0 +1,14 @@
+import fs from 'node:fs';
+import path from 'node:path';
+const root=process.cwd();
+const read=(p)=>fs.readFileSync(path.join(root,p),'utf8');
+const pkg=JSON.parse(read('package.json'));
+if(pkg.version!=='82.0.0') throw new Error('version 82 bekleniyor');
+const mig=read('db/migrations/V82.sql');
+for(const t of ['tournament_share_retention_remediation_audit','tournament_share_retention_remediation_exports','tournament_share_cleanup_comparison_drilldown','tournament_share_retention_policy_enforcement']) if(!mig.includes(`CREATE TABLE IF NOT EXISTS ${t}`)) throw new Error(`V82 tablo eksik: ${t}`);
+const worker=read('worker/index.ts');
+for(const route of ['tournamentShareV82RemediationExport','tournamentShareV82RemediationAudit','tournamentShareV82CleanupDrill','tournamentShareV82PolicyEnforce']) if(!worker.includes(route)) throw new Error(`V82 route eksik: ${route}`);
+if(!worker.includes("v82:'signed-remediation-export-alert-chain-audit-cleanup-drilldown-retention-policy-enforcement'")) throw new Error('V82 readiness marker eksik');
+const app=read('src/App.tsx');
+for(const x of ['loadTournamentShareV82','exportTournamentShareV82Remediation','enforceTournamentShareV82Policy','share-v82-ops']) if(!app.includes(x)) throw new Error(`V82 UI eksik: ${x}`);
+console.log('V82 regression OK');

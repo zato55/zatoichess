@@ -1,0 +1,18 @@
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const pkg=JSON.parse(fs.readFileSync('package.json','utf8'));
+const worker=fs.readFileSync('worker/index.ts','utf8');
+const mig=fs.readFileSync('db/migrations/V70.sql','utf8');
+assert.equal(pkg.version,'70.0.0');
+assert.match(pkg.scripts['regression:v70'],/regression-v70/);
+assert.match(mig,/tournament_share_verification_history/);
+assert.match(mig,/tournament_share_retention_runs/);
+assert.ok(worker.includes('recordVerificationHistory'));
+assert.ok(worker.includes('buildShareRouteMatrix'));
+assert.ok(worker.includes('contract-evidence\\/route-matrix'));
+assert.ok(worker.includes('route-matrix\\/export'));
+assert.ok(worker.includes('share\\/health\\/verification\\/history'));
+assert.ok(worker.includes('share-evidence-retention'));
+assert.match(worker,/v70:'retention-execution-telemetry-verification-history-route-matrix-export'/);
+assert.match(worker,/version:'70\.0\.0'/);
+console.log('V70 regression OK');

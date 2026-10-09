@@ -1,0 +1,14 @@
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const w=fs.readFileSync('worker/index.ts','utf8');
+const p=JSON.parse(fs.readFileSync('package.json','utf8'));
+assert.equal(p.version,'59.0.0');
+assert.match(w,/tournament_share_cache_daily/);
+assert.match(w,/tournament_share_alert_history/);
+assert.ok(w.includes('share\\/health\\/export'),'health export route missing');
+assert.match(w,/recordShareCache\(env\.DB/);
+assert.match(w,/conditional304:'view count is not incremented'/);
+assert.match(w,/v59:'cache-aware-analytics-alert-history-health-export-and-scheduled-retention'/);
+assert.match(fs.readFileSync('db/migrations/V59.sql','utf8'),/PRIMARY KEY\(day, share_id, route\)/);
+assert.match(fs.readFileSync('src/App.tsx','utf8'),/exportTournamentShareHealth/);
+console.log('V59 share analytics/alert history/export regression OK');

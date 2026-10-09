@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS tournament_share_v85_production_readiness (id TEXT PRIMARY KEY,tournament_id TEXT,run_id TEXT NOT NULL,overall_status TEXT NOT NULL,checks_total INTEGER NOT NULL DEFAULT 0,checks_passed INTEGER NOT NULL DEFAULT 0,checks_failed INTEGER NOT NULL DEFAULT 0,checks_blocked INTEGER NOT NULL DEFAULT 0,integrity_sha256 TEXT NOT NULL,detail TEXT,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tournament_share_v85_readiness_history (id TEXT PRIMARY KEY,tournament_id TEXT,run_id TEXT NOT NULL,status TEXT NOT NULL,check_name TEXT NOT NULL,expected TEXT,actual TEXT,detail TEXT,integrity_sha256 TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tournament_share_v85_release_gates (id TEXT PRIMARY KEY,tournament_id TEXT,gate TEXT NOT NULL,status TEXT NOT NULL,detail TEXT,integrity_sha256 TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_v85_readiness_tournament ON tournament_share_v85_production_readiness(tournament_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_v85_history_tournament ON tournament_share_v85_readiness_history(tournament_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_v85_gate_tournament ON tournament_share_v85_release_gates(tournament_id,created_at DESC);

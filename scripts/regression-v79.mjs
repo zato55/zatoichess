@@ -1,0 +1,4 @@
+import fs from 'node:fs';
+const pkg=JSON.parse(fs.readFileSync('package.json','utf8')); const worker=fs.readFileSync('worker/index.ts','utf8'); const mig=fs.readFileSync('db/migrations/V79.sql','utf8');
+const checks=[pkg.version==='79.0.0',pkg.scripts['regression:v79'],mig.includes('tournament_share_verification_export_checks'),mig.includes('tournament_share_policy_drift_ack'),mig.includes('tournament_share_replay_history_checks'),mig.includes('tournament_share_v78_cleanup_replays'),worker.includes('exports-v79\\/verify'),worker.includes('policy-drift-alerts-v79'),worker.includes('replay-v79\\/compare'),worker.includes('cleanup-replay-v79'),worker.includes("v79:'signed-export-verification-alert-lifecycle-replay-history-integrity-retention-cleanup-replay'")];
+if(checks.every(Boolean)){console.log('V79 regression OK');}else{console.error('V79 regression FAILED',checks);process.exit(1)}

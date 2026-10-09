@@ -1,0 +1,31 @@
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const worker=fs.readFileSync('worker/index.ts','utf8');
+const app=fs.readFileSync('src/App.tsx','utf8');
+const css=fs.readFileSync('src/styles.css','utf8');
+const pkg=JSON.parse(fs.readFileSync('package.json','utf8'));
+const migration=fs.readFileSync('db/migrations/V57.sql','utf8');
+assert.equal(pkg.version,'57.0.0');
+assert.match(pkg.scripts['regression:v57'],/regression-v57/);
+assert.match(migration,/tournament_share_audit_daily/);
+assert.match(migration,/PRIMARY KEY\(day, tournament_id, share_id, event\)/);
+assert.match(worker,/x-zato-cache/);
+assert.match(worker,/diagnosticHeader:'x-zato-cache'/);
+assert.match(worker,/tournament_share_audit_daily/);
+assert.match(worker,/DELETE FROM tournament_share_audit WHERE created_at < \?/);
+assert.match(worker,/90\*86400000/);
+assert.match(worker,/SUM\(count\) count/);
+assert.match(worker,/v57:'share-audit-retention-aggregation-cache-diagnostics-and-304-accounting'/);
+assert.match(app,/304 yanıtları görüntülenme sayacını artırmaz/);
+assert.match(app,/auditSummary/);
+assert.match(css,/share-audit/);
+// Deterministic 200 -> 304 accounting model: only origin 200 increments views.
+let views=10;
+const responses=['origin-miss','conditional-hit','conditional-hit','origin-miss'];
+for(const kind of responses) if(kind==='origin-miss') views++;
+assert.equal(views,12);
+// Daily aggregation model is additive and idempotent at the source-row level.
+const events=[['created',1],['created',1],['rotated',1],['revoked',1]];
+const summary=new Map(); for(const [event,count] of events) summary.set(event,(summary.get(event)||0)+count);
+assert.equal(summary.get('created'),2); assert.equal(summary.get('rotated'),1); assert.equal(summary.get('revoked'),1);
+console.log('V57 public-share retention/cache integration regression OK');

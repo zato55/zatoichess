@@ -1,0 +1,11 @@
+import fs from 'node:fs';
+const worker=fs.readFileSync(new URL('../worker/index.ts',import.meta.url),'utf8');
+const pkg=JSON.parse(fs.readFileSync(new URL('../package.json',import.meta.url),'utf8'));
+const migration=fs.readFileSync(new URL('../db/migrations/V76.sql',import.meta.url),'utf8');
+const context=fs.readFileSync(new URL('../docs/continuation/ZATO_PROJECT_CONTEXT.md',import.meta.url),'utf8');
+const app=fs.readFileSync(new URL('../src/App.tsx',import.meta.url),'utf8');
+for(const x of ['76.0.0','verify-v76','export-v76','policy-history']) if(!(worker.includes(x)||context.includes(x)||pkg.version===x)) throw new Error('missing '+x);
+for(const x of ['tournament_share_replay_bundle_verification_audit','tournament_share_retention_policy_check_history','tournament_share_cleanup_replay_exports']) if(!migration.includes(x)) throw new Error('migration '+x);
+for(const x of ['keyStatus','signatureValid','HMAC-SHA256','integrityValid']) if(!worker.includes(x)) throw new Error('worker '+x);
+for(const x of ['tournamentShareV76VerificationHistory','exportTournamentShareV76Bundle']) if(!app.includes(x)) throw new Error('ui '+x);
+console.log('V76 regression OK');

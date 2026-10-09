@@ -1,0 +1,1 @@
+DELETE FROM matchmaking_queue;

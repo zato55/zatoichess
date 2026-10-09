@@ -827,75 +827,22 @@ export default {
       const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
       try { const b=await request.json().catch(()=>({})) as any; const kind=(b.kind==='weekly'?'weekly':'daily') as 'daily'|'weekly'; const c=await ensureCup(env.DB,kind); await env.DB.prepare(`UPDATE cup_participants SET left_at=? WHERE cup_id=? AND user_id=? AND left_at IS NULL`).bind(new Date().toISOString(),c.id,user.id).run(); return json({ok:true,joined:false}); } catch { return json({error:'Cup çıkışı başarısız.'},{status:400}); }
     }
-   // ═══════════════════════════════════════════════════════════════
-// /api/cup/history — teşhis modu (geçici): gerçek hatayı döner
-// ═══════════════════════════════════════════════════════════════
-if (url.pathname === '/api/cup/history' && request.method === 'GET') {
-  if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503});
-  const user=await authUser(request,env);
-  if(!user)return json({error:'Giriş gerekli.'},{status:401});
-
-  // finalizeCupRewards hatası ana akışı bozmasın
-  try {
-    await finalizeCupRewards(env.DB);
-  } catch(e) {
-    console.error('[cup/history] finalizeCupRewards HATA:', e);
-  }
-
-  try {
-    const rows=(await env.DB.prepare(
-      `SELECT id,label,kind,starts_at,ends_at,status FROM cup_events WHERE status='finished' ORDER BY ends_at DESC LIMIT 16`
-    ).all<any>()).results||[];
-
-    console.log('[cup/history] finished cup sayısı:', rows.length);
-
-    const history:any[]=[];
-    for(const c of rows){
+    if (url.pathname === '/api/cup/history' && request.method === 'GET') {
+      if(!env.DB)return json({error:'D1 yapılandırılmamış.'},{status:503});
+      const user=await authUser(request,env); if(!user)return json({error:'Giriş gerekli.'},{status:401});
       try {
-        const r=await env.DB.prepare(
-          `SELECT COALESCE(SUM(CASE WHEN ((g.white_user_id=cp.user_id AND g.result='1-0') OR (g.black_user_id=cp.user_id AND g.result='0-1')) THEN 2 WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) points,
-                  COUNT(DISTINCT g.id) games,
-                  COALESCE(SUM(CASE WHEN ((g.white_user_id=cp.user_id AND g.result='1-0') OR (g.black_user_id=cp.user_id AND g.result='0-1') THEN 1 ELSE 0 END),0) wins,
-                  COALESCE(SUM(CASE WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) draws
-           FROM cup_participants cp
-           LEFT JOIN cup_participants op ON op.cup_id=cp.cup_id AND op.user_id<>cp.user_id
-           LEFT JOIN games g ON g.status='finished' AND g.ended_at>=? AND g.ended_at<?
-             AND ((g.white_user_id=cp.user_id AND g.black_user_id=op.user_id) OR (g.black_user_id=cp.user_id AND g.white_user_id=op.user_id))
-             AND g.ended_at>=cp.joined_at AND (cp.left_at IS NULL OR g.ended_at<=cp.left_at)
-             AND g.ended_at>=op.joined_at AND (op.left_at IS NULL OR g.ended_at<=op.left_at)
-           WHERE cp.cup_id=? AND cp.user_id=?`
-        ).bind(c.starts_at,c.ends_at,c.id,user.id).first<any>();
-
-        const reward=await env.DB.prepare(
-          `SELECT rank,reward_key FROM cup_rewards WHERE cup_id=? AND user_id=?`
-        ).bind(c.id,user.id).first<any>();
-
-        const games=Number(r?.games||0),wins=Number(r?.wins||0),draws=Number(r?.draws||0);
-        history.push({
-          ...c,
-          stats:{
-            points:Number(r?.points||0),games,wins,draws,
-            losses:Math.max(0,games-wins-draws),
-            winRate:games?Math.round(wins*1000/games)/10:0
-          },
-          reward:reward?{rank:Number(reward.rank),rewardKey:String(reward.reward_key)}:null
-        });
-      } catch(rowErr) {
-        console.error('[cup/history] tek cup hata (cupId='+c.id+'):', rowErr);
-      }
+        await finalizeCupRewards(env.DB);
+        const rows=(await env.DB.prepare(`SELECT id,label,kind,starts_at,ends_at,status FROM cup_events WHERE status='finished' ORDER BY ends_at DESC LIMIT 16`).all<any>()).results||[];
+        const history:any[]=[];
+        for(const c of rows){
+          const r=await env.DB.prepare(`SELECT COALESCE(SUM(CASE WHEN ((g.white_user_id=cp.user_id AND g.result='1-0') OR (g.black_user_id=cp.user_id AND g.result='0-1')) THEN 2 WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) points,COUNT(DISTINCT g.id) games,COALESCE(SUM(CASE WHEN ((g.white_user_id=cp.user_id AND g.result='1-0') OR (g.black_user_id=cp.user_id AND g.result='0-1') THEN 1 ELSE 0 END),0) wins,COALESCE(SUM(CASE WHEN g.result='1/2-1/2' THEN 1 ELSE 0 END),0) draws FROM cup_participants cp LEFT JOIN cup_participants op ON op.cup_id=cp.cup_id AND op.user_id<>cp.user_id LEFT JOIN games g ON g.status='finished' AND g.ended_at>=? AND g.ended_at<? AND ((g.white_user_id=cp.user_id AND g.black_user_id=op.user_id) OR (g.black_user_id=cp.user_id AND g.white_user_id=op.user_id)) AND g.ended_at>=cp.joined_at AND (cp.left_at IS NULL OR g.ended_at<=cp.left_at) AND g.ended_at>=op.joined_at AND (op.left_at IS NULL OR g.ended_at<=op.left_at) WHERE cp.cup_id=? AND cp.user_id=?`).bind(c.starts_at,c.ends_at,c.id,user.id).first<any>();
+          const reward=await env.DB.prepare(`SELECT rank,reward_key FROM cup_rewards WHERE cup_id=? AND user_id=?`).bind(c.id,user.id).first<any>();
+          const games=Number(r?.games||0),wins=Number(r?.wins||0),draws=Number(r?.draws||0);
+          history.push({...c,stats:{points:Number(r?.points||0),games,wins,draws,losses:Math.max(0,games-wins-draws),winRate:games?Math.round(wins*1000/games)/10:0},reward:reward?{rank:Number(reward.rank),rewardKey:String(reward.reward_key)}:null});
+        }
+        return json({history});
+      } catch { return json({error:'Cup geçmişi yüklenemedi.'},{status:400}); }
     }
-
-    return json({history});
-  } catch(e){
-    // ⚠️ GEÇİCİ: hatayı response'a yaz ki görelim
-    console.error('[cup/history] FATAL:', e);
-    return json({
-      error:'Cup geçmişi yüklenemedi.',
-      detail: String(e instanceof Error ? e.message : e).slice(0,500),
-      stack: e instanceof Error ? String(e.stack||'').slice(0,800) : null
-    },{status:400});
-  }
-}
 
     // ═══════════════════════════════════════════════════════════
     // TOURNAMENT SHARE — STATS / HEALTH / ACK / MAINTENANCE / ROTATE

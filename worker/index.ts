@@ -2299,7 +2299,7 @@ export class RoomDurableObject {
       server.accept();
       const sid=crypto.randomUUID();
       this.spectators.set(sid,server);
-      server.send(JSON.stringify({type:'room:spectator',gameId:this.gameId,fen:this.game.fen(),turn:this.game.turn(),history:this.history,result:this.result,whiteMs:this.currentClock('w'),blackMs:this.currentClock('b'),members:this.players.size,started:this.players.size===2&&this.result==='*'}));
+      server.send(JSON.stringify({type:'room:spectator',gameId:this.gameId,players:[...this.players.values()].map(p=>({color:p.color,displayName:p.displayName,username:p.username})),fen:this.game.fen(),turn:this.game.turn(),history:this.history,result:this.result,whiteMs:this.currentClock('w'),blackMs:this.currentClock('b'),members:this.players.size,started:this.players.size===2&&this.result==='*'}));
       const cleanup=()=>this.spectators.delete(sid);
       server.addEventListener('close',cleanup);
       server.addEventListener('error',cleanup);
@@ -2342,8 +2342,8 @@ export class RoomDurableObject {
     }
     await this.persist();
 
-    server.send(JSON.stringify({type:'room:joined',gameId:this.gameId,playerId:id,user:{id:userId,username,displayName,rating},color,members:this.players.size,started,fen:this.game.fen(),turn:this.game.turn(),history:this.history,result:this.result,whiteMs:this.currentClock('w'),blackMs:this.currentClock('b'),startedAt:this.startedAt}));
-    this.broadcast({type:'room:state',members:this.players.size,started,fen:this.game.fen(),turn:this.game.turn(),result:this.result,history:this.history,whiteMs:this.currentClock('w'),blackMs:this.currentClock('b')});
+    server.send(JSON.stringify({type:'room:joined',gameId:this.gameId,playerId:id,user:{id:userId,username,displayName,rating},players:[...this.players.values()].map(p=>({color:p.color,displayName:p.displayName,username:p.username})),color,members:this.players.size,started,fen:this.game.fen(),turn:this.game.turn(),history:this.history,result:this.result,whiteMs:this.currentClock('w'),blackMs:this.currentClock('b'),startedAt:this.startedAt}));
+    this.broadcast({type:'room:state',members:this.players.size,started,players:[...this.players.values()].map(p=>({color:p.color,displayName:p.displayName,username:p.username})),fen:this.game.fen(),turn:this.game.turn(),result:this.result,history:this.history,whiteMs:this.currentClock('w'),blackMs:this.currentClock('b')});
 
     server.addEventListener('message', async e=>{
       try {
@@ -2402,7 +2402,7 @@ export class RoomDurableObject {
     const close=async()=>{
       this.players.delete(id);
       await this.persist();
-      this.broadcast({type:'room:state',members:this.players.size,started:this.players.size===2&&this.result==='*',fen:this.game.fen(),turn:this.game.turn(),result:this.result,history:this.history,whiteMs:this.currentClock('w'),blackMs:this.currentClock('b')});
+      this.broadcast({type:'room:state',members:this.players.size,started:this.players.size===2&&this.result==='*',players:[...this.players.values()].map(p=>({color:p.color,displayName:p.displayName,username:p.username})),fen:this.game.fen(),turn:this.game.turn(),result:this.result,history:this.history,whiteMs:this.currentClock('w'),blackMs:this.currentClock('b')});
     };
     server.addEventListener('close',()=>{void close();});
     server.addEventListener('error',()=>{void close();});

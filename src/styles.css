@@ -51,7 +51,6 @@
 
 .tournament-standings{margin-top:10px}.tournament-standings .social-row{padding:7px 0}.tournament-standings strong{font-size:12px}.tournament-match.is-tiebreak{box-shadow:inset 3px 0 0 rgba(255,255,255,.18)}
 .tournament-analytics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:10px 0}.tournament-analytics span,.tournament-profile .profile-head span{padding:9px 10px;border:1px solid var(--line,#263047);border-radius:10px;background:rgba(255,255,255,.02);font-size:12px}.tournament-profile .social-row{margin-top:6px}.tournament-profile .social-row button{white-space:nowrap}@media(max-width:720px){.tournament-analytics{grid-template-columns:1fr}}
-.tournament-analytics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:10px 0}.tournament-analytics span,.tournament-profile .profile-head span{padding:9px 10px;border:1px solid var(--line,#263047);border-radius:10px;background:rgba(255,255,255,.02);font-size:12px}.tournament-profile .social-row{margin-top:6px}.tournament-profile .social-row button{white-space:nowrap}@media(max-width:720px){.tournament-analytics{grid-template-columns:1fr}}
 .tournament-rounds{margin-top:10px}.tournament-rounds .social-row{padding:7px 0}.match-ratings{font-size:10px!important;opacity:.55!important;white-space:nowrap}.tournament-match .social-actions button{font-size:11px}.tournament-match .social-actions{align-items:center}
 .tournament-title-actions{display:flex;align-items:center;gap:6px;margin-left:auto}.tournament-title-actions button{border:1px solid #2b3039;background:#171b21;color:#d9dde4;border-radius:7px;padding:5px 8px;font-size:10px;cursor:pointer}.tournament-headtohead{margin-top:10px}.tournament-headtohead .social-row{padding:7px 0}
 
@@ -77,4 +76,120 @@
 .share-replay-diff{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}.share-replay-diff span{padding:4px 6px;border:1px solid #2b3039;border-radius:6px;font-size:10px}.share-key-lifecycle{margin-top:10px}.share-key-lifecycle .social-row{padding:7px 0}.share-key-lifecycle button{font-size:10px;padding:4px 7px}.share-export-verification code{display:block;overflow:auto;margin-top:4px;font-size:9px;opacity:.7}
 .share-route-matrix,.share-verification-history{margin-top:10px;padding:9px;border:1px solid rgba(255,255,255,.08);border-radius:9px}.share-route-matrix .social-row,.share-verification-history .social-row{padding:7px 0}.share-route-matrix>button{margin-top:7px}.share-verification-history span{font-size:10px}
 .share-v76-ops{display:grid;gap:8px;margin-top:10px}.share-v76-ops code{font-size:10px;opacity:.7}
-.share-v76-ops{display:grid;gap:8px;margin-top:10px}.share-v76-ops code{font-size:10px;opacity:.7}
+
+/* === TAHTA TEMİZLEME - EN SON (override) === */
+.square {
+  border: 0 !important;
+  box-shadow: none !important;
+  outline: none !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border-radius: 0 !important;
+  -webkit-appearance: none !important;
+  appearance: none !important;
+  background-clip: padding-box !important;
+  font: inherit !important;
+  transition: none !important;
+  filter: none !important;
+}
+
+.square:hover {
+  filter: none !important;
+  box-shadow: none !important;
+  border: 0 !important;
+}
+
+.square.light { background: #f0d9b5 !important; }
+.square.dark  { background: #b58863 !important; }
+
+.square.last {
+  box-shadow: inset 0 0 0 3px rgba(139, 184, 255, 0.85) !important;
+}
+
+.square.selected {
+  box-shadow: inset 0 0 0 3px #ffcc00 !important;
+}
+
+.square.legal:after {
+  content: "" !important;
+  width: 20% !important;
+  aspect-ratio: 1 !important;
+  border-radius: 50% !important;
+  background: rgba(0, 0, 0, 0.28) !important;
+  position: absolute !important;
+}
+
+.square.legal:has(.piece):after {
+  width: 86% !important;
+  height: 86% !important;
+  background: transparent !important;
+  border: 5px solid rgba(229, 57, 53, 0.44) !important;
+}
+
+/* Taşların gölgesini kaldır, sadece ince kontur ver */
+.piece {
+  filter: none !important;
+  font-family: "Segoe UI Symbol", "Arial Unicode MS", "DejaVu Sans", sans-serif !important;
+}
+
+.white-piece {
+  color: #f5f5f5 !important;
+  text-shadow:
+    0 1px 0 #000,
+    1px 0 0 #000,
+    -1px 0 0 #000,
+    0 -1px 0 #000 !important;
+}
+
+.black-piece {
+  color: #1a1a1a !important;
+  text-shadow:
+    0 1px 0 #fff,
+    1px 0 0 #fff,
+    -1px 0 0 #fff,
+    0 -1px 0 #fff !important;
+}
+
+.board {
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5) !important;
+}
+/* === KARELERİ KESİN KARE YAP - FINAL === */
+.board {
+  display: grid !important;
+  grid-template-columns: repeat(8, minmax(0, 1fr)) !important;
+  grid-template-rows: repeat(8, minmax(0, 1fr)) !important;
+  width: 100% !important;
+  height: auto !important;
+  aspect-ratio: 1 / 1 !important;
+  border: 4px solid #15181e !important;
+  box-sizing: border-box !important;
+  gap: 0 !important;
+  overflow: hidden !important;
+}
+
+.board > button.square,
+.square {
+  position: relative !important;
+  width: 100% !important;
+  height: 100% !important;
+  aspect-ratio: 1 / 1 !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  max-width: none !important;
+  max-height: none !important;
+  display: grid !important;
+  place-items: center !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-sizing: border-box !important;
+  overflow: hidden !important;
+}
+/* Taş boyutunu büyüt */
+.piece {
+  font-size: clamp(2rem, 5.5vw, 4rem) !important;
+}
+.board {
+  max-width: 640px !important;
+}
